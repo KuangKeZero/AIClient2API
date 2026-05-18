@@ -4,9 +4,14 @@
     <h2 id="usage-title" data-i18n="usage.title">用量查询</h2>
     <div class="usage-panel">
         <div class="usage-controls">
-            <button class="btn btn-primary" id="refreshUsageBtn" aria-label="Refresh Usage" data-i18n-aria-label="usage.refresh">
-                <i class="fas fa-sync-alt"></i> <span data-i18n="usage.refresh">刷新用量</span>
-            </button>
+            <div class="usage-control-actions">
+                <button class="btn btn-primary" id="refreshUsageBtn" aria-label="Refresh Usage" data-i18n-aria-label="usage.refresh">
+                    <i class="fas fa-sync-alt"></i> <span data-i18n="usage.refresh">刷新用量</span>
+                </button>
+                <button class="btn btn-secondary" id="syncProviderPoolUsageBtn" aria-label="同步账号池" data-i18n-aria-label="usage.syncProviderPool">
+                    <i class="fas fa-link"></i> <span data-i18n="usage.syncProviderPool">同步账号池</span>
+                </button>
+            </div>
             <span class="usage-last-update" id="usageLastUpdate" data-i18n="usage.lastUpdate" data-i18n-params='{"time":"--"}'>上次更新: --</span>
             <span class="server-time-display" id="serverTimeDisplay">
              <span data-i18n="usage.serverTime">服务端时间</span>: <span id="serverTimeValue">--</span>
@@ -19,6 +24,11 @@
             <span id="supportedProvidersList" class="supported-providers-tags">
                 <span class="loading-inline"><i class="fas fa-spinner fa-spin"></i></span>
             </span>
+        </div>
+
+        <div class="usage-quota-rules" id="usageQuotaRules" hidden>
+            <i class="fas fa-route"></i>
+            <span id="usageQuotaRulesText"></span>
         </div>
         
         <div class="usage-loading" id="usageLoading" style="display: none;">

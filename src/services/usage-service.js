@@ -31,6 +31,20 @@ export class UsageService {
         };
     }
 
+    resolveSupportedProvider(providerType) {
+        if (this.providerHandlers[providerType]) {
+            return providerType;
+        }
+
+        return Object.keys(this.providerHandlers).find((baseProviderType) =>
+            typeof providerType === 'string' && providerType.startsWith(baseProviderType + '-')
+        ) || null;
+    }
+
+    supportsProvider(providerType) {
+        return this.resolveSupportedProvider(providerType) !== null;
+    }
+
     /**
      * 获取指定提供商的用量信息（原始数据）
      * @param {string} providerType - 提供商类型
@@ -38,11 +52,11 @@ export class UsageService {
      * @returns {Promise<Object>} 原始用量数据
      */
     async getUsage(providerType, uuid = null) {
-        const handler = this.providerHandlers[providerType];
-        if (!handler) {
+        const baseProviderType = this.resolveSupportedProvider(providerType);
+        if (!baseProviderType) {
             throw new Error(`不支持的提供商类型: ${providerType}`);
         }
-        return handler(uuid);
+        return this._getRawUsageFromAdapter(providerType, uuid);
     }
 
     /**
@@ -53,7 +67,8 @@ export class UsageService {
      */
     formatUsage(providerType, rawUsage) {
         if (!rawUsage) return null;
-        const formatter = this.formatters[providerType];
+        const baseProviderType = this.resolveSupportedProvider(providerType);
+        const formatter = this.formatters[baseProviderType];
         if (typeof formatter === 'function') {
             return formatter(rawUsage);
         }

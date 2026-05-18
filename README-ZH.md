@@ -677,6 +677,7 @@ kill -9 <PID>
 - **配置账号池**：添加多个账号到 `provider_pools.json`，启用轮询机制
 - **配置 Fallback**：在 `config.json` 中配置 `providerFallbackChain`，实现跨类型降级
 - **启用 429 短冷却**：将 `RATE_LIMIT_COOLDOWN_ENABLED` 设为 `true`，并通过 `RATE_LIMIT_COOLDOWN_MS` 设置默认冷却时间，让被限流账号短暂退出账号池后自动恢复
+- **本地额度账本**：默认启用 `ACCOUNT_QUOTA_LEDGER`，每个账号会在 `configs/account_quota_ledger.json` 维护 `lastRealUsagePercent`、`estimatedUsagePercent`、`resetAt`、`disabledUntil`、`confidence`、`recent429`、`recent401`。路由会直接跳过 Free 估算用量 `>= 70%`、Plus/Pro 估算用量 `>= 90%`、仍在冷却期、并发已满的账号；连续 3 次 401/403 的账号会从账号池配置中移除。真实用量刷新只在新账号首次入池、估算接近阈值且置信度不足、到达 `resetAt` 准备恢复、可用账号快耗尽、疑似额度型 429 时触发。
 - **降低请求频率**：适当增加请求间隔，避免触发速率限制
 - **等待配额重置**：免费配额通常每日或每分钟重置
 

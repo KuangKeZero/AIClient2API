@@ -333,6 +333,11 @@ export async function handleUIApiRequests(method, pathParam, req, res, currentCo
         return await usageApi.handleGetSupportedProviders(req, res);
     }
 
+    // Sync cached usage with provider pool without querying external usage APIs
+    if (method === 'POST' && pathParam === '/api/usage/sync-provider-pool') {
+        return await usageApi.handleSyncProviderPoolUsage(req, res, currentConfig, providerPoolManager);
+    }
+
     // Get usage limits for a specific provider type
     const usageProviderMatch = pathParam.match(/^\/api\/usage\/([^\/]+)$/);
     if (method === 'GET' && usageProviderMatch) {

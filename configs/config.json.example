@@ -17,6 +17,26 @@
     "RATE_LIMIT_COOLDOWN_MS": 30000,
     "RATE_LIMIT_COOLDOWN_JITTER_MS": 5000,
     "RATE_LIMIT_COOLDOWN_MAX_MS": 300000,
+    "ACCOUNT_QUOTA_LEDGER": {
+        "enabled": true,
+        "filePath": "configs/account_quota_ledger.json",
+        "freeThresholdPercent": 70,
+        "plusThresholdPercent": 90,
+        "defaultThresholdPercent": 85,
+        "nearThresholdMarginPercent": 5,
+        "minConfidenceForNearThreshold": 0.65,
+        "shortCooldownMs": 30000,
+        "longCooldownMs": 21600000,
+        "lowFrequencyVerificationMs": 3600000,
+        "authDeleteCount": 3,
+        "poolLowAvailableCount": 1,
+        "poolLowAvailableRatio": 0.2,
+        "tokensPerPercent": {
+            "free": 150000,
+            "plus": 250000,
+            "default": 250000
+        }
+    },
     "CRON_NEAR_MINUTES": 1,
     "CRON_REFRESH_TOKEN": false,
     "PROVIDER_POOLS_FILE_PATH": "configs/provider_pools.json",
@@ -38,7 +58,7 @@
         "targetModel": "claude-opus-4-5"
       },
       "gemini-claude-sonnet-4-5-thinking": {
-        "targetProviderType": "claude-kiro-oauth", 
+        "targetProviderType": "claude-kiro-oauth",
         "targetModel": "claude-sonnet-4-5"
       },
       "gemini-claude-sonnet-4-5": {

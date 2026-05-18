@@ -492,7 +492,11 @@ export class CodexApiService {
             logger.info('[Codex] Token refreshed successfully');
         } catch (error) {
             logger.error('[Codex] Failed to refresh token:', error.message);
-            throw new Error('Failed to refresh Codex token. Please re-authenticate.');
+            const wrappedError = new Error('Failed to refresh Codex token. Please re-authenticate.');
+            wrappedError.status = error?.response?.status || error?.status || error?.statusCode;
+            wrappedError.response = error?.response;
+            wrappedError.cause = error;
+            throw wrappedError;
         }
     }
 
@@ -656,6 +660,7 @@ export class CodexApiService {
                             const errorMsg = (parsed.error && parsed.error.message) || JSON.stringify(parsed.error || parsed);
                             const error = new Error(`Codex API error: ${errorMsg}`);
                             if (parsed.error?.code === 'insufficient_quota' || parsed.error?.type === 'insufficient_quota') {
+                                error.status = 429;
                                 error.shouldSwitchCredential = true;
                                 error.skipErrorCount = true;
                             }
@@ -693,6 +698,7 @@ export class CodexApiService {
                         const errorMsg = (parsed.error && parsed.error.message) || JSON.stringify(parsed.error || parsed);
                         const error = new Error(`Codex API error: ${errorMsg}`);
                         if (parsed.error?.code === 'insufficient_quota' || parsed.error?.type === 'insufficient_quota') {
+                            error.status = 429;
                             error.shouldSwitchCredential = true;
                             error.skipErrorCount = true;
                         }
@@ -758,6 +764,7 @@ export class CodexApiService {
                         const errorMsg = (parsed.error && parsed.error.message) || JSON.stringify(parsed.error || parsed);
                         const error = new Error(`Codex API error: ${errorMsg}`);
                         if (parsed.error?.code === 'insufficient_quota' || parsed.error?.type === 'insufficient_quota') {
+                            error.status = 429;
                             error.shouldSwitchCredential = true;
                             error.skipErrorCount = true;
                         }
@@ -957,4 +964,3 @@ export class CodexApiService {
         }
     }
 }
-

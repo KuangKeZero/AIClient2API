@@ -7,6 +7,289 @@ import { t, getCurrentLanguage } from './i18n.js';
 // 提供商配置缓存
 let currentProviderConfigs = null;
 let usagePageDataPromise = null;
+const pendingRestoreState = {
+    page: 1,
+    pageSize: 20,
+    collapsed: true
+};
+
+function getLocalPlanClass(plan) {
+    if (!plan) return 'plan-default';
+    const normalized = String(plan).toLowerCase();
+    if (normalized.includes('free')) return 'plan-free';
+    if (normalized.includes('pro+') || normalized.includes('pro +')) return 'plan-pro-plus';
+    if (normalized.includes('pro')) return 'plan-pro';
+    if (normalized.includes('plus') || normalized.includes('+')) return 'plan-plus';
+    if (normalized.includes('team') || normalized.includes('ent')) return 'plan-team';
+    if (normalized.includes('basic')) return 'plan-basic';
+    if (normalized.includes('super')) return 'plan-super';
+    if (normalized.includes('heavy')) return 'plan-heavy';
+    if (normalized.includes('standard')) return 'plan-standard';
+    return 'plan-default';
+}
+
+function formatPendingReason(reason) {
+    const keyMap = {
+        cooldown: 'usage.pending.reason.cooldown',
+        estimated_threshold: 'usage.pending.reason.estimated_threshold',
+        waiting_reset: 'usage.pending.reason.waiting_reset',
+        awaiting_reset_refresh: 'usage.pending.reason.awaiting_reset_refresh',
+        refresh_pending: 'usage.pending.reason.refresh_pending',
+        low_frequency_verify: 'usage.pending.reason.low_frequency_verify'
+    };
+
+    return t(keyMap[reason] || 'usage.pending.reason.unknown');
+}
+
+function formatRecoveryDate(value) {
+    if (!value) return t('usage.pending.recoveryUnknown');
+    return formatDate(value);
+}
+
+function formatRulePercent(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return '--';
+    return Number.isInteger(numeric) ? String(numeric) : numeric.toFixed(1);
+}
+
+function formatRuleRatioPercent(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return '--';
+    const percent = numeric * 100;
+    return Number.isInteger(percent) ? String(percent) : percent.toFixed(1);
+}
+
+function updateQuotaRulesInfo(data) {
+    const container = document.getElementById('usageQuotaRules');
+    const textEl = document.getElementById('usageQuotaRulesText');
+    if (!container || !textEl) return;
+
+    const rules = data?.quotaRules;
+    if (!rules) {
+        container.hidden = true;
+        container.classList.remove('is-disabled');
+        textEl.textContent = '';
+        textEl.removeAttribute('data-i18n');
+        textEl.removeAttribute('data-i18n-params');
+        return;
+    }
+
+    container.hidden = false;
+    if (rules.enabled === false) {
+        container.classList.add('is-disabled');
+        textEl.textContent = t('usage.rules.disabled');
+        textEl.setAttribute('data-i18n', 'usage.rules.disabled');
+        textEl.removeAttribute('data-i18n-params');
+        return;
+    }
+
+    container.classList.remove('is-disabled');
+    const params = {
+        free: formatRulePercent(rules.freeThresholdPercent),
+        plus: formatRulePercent(rules.plusThresholdPercent),
+        defaultThreshold: formatRulePercent(rules.defaultThresholdPercent),
+        lowCount: Number(rules.poolLowAvailableCount || 0),
+        lowRatio: formatRuleRatioPercent(rules.poolLowAvailableRatio)
+    };
+    textEl.textContent = t('usage.rules.summary', params);
+    textEl.setAttribute('data-i18n', 'usage.rules.summary');
+    textEl.setAttribute('data-i18n-params', JSON.stringify(params));
+}
+
+function clampPendingRestorePage(totalItems) {
+    const totalPages = Math.max(1, Math.ceil(totalItems / pendingRestoreState.pageSize));
+    pendingRestoreState.page = Math.min(Math.max(1, pendingRestoreState.page), totalPages);
+    return totalPages;
+}
+
+function getPendingRestorePageSlice(pendingAccounts) {
+    const totalPages = clampPendingRestorePage(pendingAccounts.length);
+    const startIndex = (pendingRestoreState.page - 1) * pendingRestoreState.pageSize;
+    const endIndex = Math.min(startIndex + pendingRestoreState.pageSize, pendingAccounts.length);
+    return {
+        totalPages,
+        startIndex,
+        endIndex,
+        accounts: pendingAccounts.slice(startIndex, endIndex)
+    };
+}
+
+function createPendingRestoreRow(account) {
+    const row = document.createElement('div');
+    row.className = 'usage-pending-row';
+    row.setAttribute('data-provider', account.providerType || '');
+    row.setAttribute('data-uuid', account.uuid || '');
+
+    const displayName = account.customName || account.name || account.uuid || t('usage.pending.unnamed');
+    const planClass = getLocalPlanClass(account.plan);
+    const estimated = Number(account.estimatedUsagePercent || 0);
+    const threshold = Number(account.thresholdPercent || 0);
+    const confidence = Math.max(0, Math.min(1, Number(account.confidence || 0)));
+    const usageLabel = t('usage.pending.usage', {
+        used: estimated.toFixed(1),
+        threshold: threshold.toFixed(0)
+    });
+    const recoveryLabel = t('usage.pending.recoveryAt', {
+        time: formatRecoveryDate(account.recoveryAt)
+    });
+    const reasonLabel = formatPendingReason(account.reason || account.refreshReason);
+    const providerLabel = account.providerType ? getProviderDisplayName(account.providerType) : t('usage.pending.unnamed');
+    const confidenceLabel = t('usage.pending.confidence', { value: Math.round(confidence * 100) });
+    const refreshTitle = t('usage.pending.refresh');
+
+    row.innerHTML = `
+        <div class="usage-pending-main">
+            <div class="usage-pending-name-line">
+                <i class="fas fa-clock usage-pending-icon"></i>
+                <span class="usage-pending-name" title="${displayName}">${displayName}</span>
+                ${account.plan ? `<span class="usage-pending-plan ${planClass}">${account.plan}</span>` : ''}
+            </div>
+            <div class="usage-pending-meta">
+                <span class="usage-pending-chip">${providerLabel}</span>
+                <span class="usage-pending-chip">${usageLabel}</span>
+                <span class="usage-pending-chip">${recoveryLabel}</span>
+                <span class="usage-pending-chip">${reasonLabel}</span>
+                <span class="usage-pending-chip">${confidenceLabel}</span>
+                ${account.recent401Count > 0 ? `<span class="usage-pending-chip">${t('usage.pending.recent401', { count: account.recent401Count })}</span>` : ''}
+                ${account.recent429Count > 0 ? `<span class="usage-pending-chip">${t('usage.pending.recent429', { count: account.recent429Count })}</span>` : ''}
+            </div>
+        </div>
+        <div class="usage-pending-row-actions">
+            <button class="btn-pending-refresh" title="${refreshTitle}" aria-label="${refreshTitle}">
+                <i class="fas fa-sync-alt"></i>
+            </button>
+        </div>
+    `;
+
+    row.querySelector('.btn-pending-refresh').onclick = (e) => {
+        e.stopPropagation();
+        refreshSingleInstanceUsage(account.providerType, account.uuid, displayName);
+    };
+
+    return row;
+}
+
+function createPendingRestoreSection(pendingAccounts) {
+    const section = document.createElement('div');
+    section.className = 'usage-pending-section';
+    section.setAttribute('data-section', 'pending-restore');
+
+    const { totalPages, startIndex, endIndex, accounts } = getPendingRestorePageSlice(pendingAccounts);
+
+    section.innerHTML = `
+        <div class="usage-pending-header">
+            <div class="usage-pending-title">
+                <button class="btn-pending-toggle" type="button" title="${pendingRestoreState.collapsed ? t('usage.pending.expand') : t('usage.pending.collapse')}" aria-label="${pendingRestoreState.collapsed ? t('usage.pending.expand') : t('usage.pending.collapse')}">
+                    <i class="fas ${pendingRestoreState.collapsed ? 'fa-chevron-down' : 'fa-chevron-up'}"></i>
+                </button>
+                <i class="fas fa-hourglass-half"></i>
+                <span>${t('usage.pending.title')}</span>
+                <span class="usage-pending-count">${t('usage.pending.count', { count: pendingAccounts.length })}</span>
+            </div>
+            <div class="usage-pending-header-actions">
+                <button class="btn-pending-verify-all" type="button" title="${t('usage.pending.verifyAll')}" aria-label="${t('usage.pending.verifyAll')}">
+                    <i class="fas fa-stethoscope"></i>
+                    <span>${t('usage.pending.verifyAll')}</span>
+                </button>
+            </div>
+        </div>
+        <div class="usage-pending-body ${pendingRestoreState.collapsed ? 'is-collapsed' : ''}">
+            <div class="usage-pending-list"></div>
+            <div class="usage-pending-footer">
+                <div class="usage-pending-page-info">
+                    <span data-i18n="pagination.showing" data-i18n-params='{"start":"${pendingAccounts.length === 0 ? 0 : startIndex + 1}","end":"${endIndex}","total":"${pendingAccounts.length}"}'>${t('pagination.showing', { start: pendingAccounts.length === 0 ? 0 : startIndex + 1, end: endIndex, total: pendingAccounts.length })}</span>
+                </div>
+                <div class="usage-pending-pagination">
+                    <button class="btn-pending-page btn-pending-prev" type="button" ${pendingRestoreState.page <= 1 ? 'disabled' : ''} title="${t('usage.pending.prevPage')}" aria-label="${t('usage.pending.prevPage')}">
+                        <i class="fas fa-chevron-left"></i>
+                    </button>
+                    <span class="usage-pending-page-label">${t('usage.pending.page', { page: pendingRestoreState.page, pages: totalPages })}</span>
+                    <button class="btn-pending-page btn-pending-next" type="button" ${pendingRestoreState.page >= totalPages ? 'disabled' : ''} title="${t('usage.pending.nextPage')}" aria-label="${t('usage.pending.nextPage')}">
+                        <i class="fas fa-chevron-right"></i>
+                    </button>
+                    <label class="usage-pending-page-size-label">
+                        <span>${t('usage.pending.pageSize')}</span>
+                        <select class="usage-pending-page-size" aria-label="${t('usage.pending.pageSize')}">
+                            ${[10, 20, 50, 100].map(size => `<option value="${size}" ${size === pendingRestoreState.pageSize ? 'selected' : ''}>${size}</option>`).join('')}
+                        </select>
+                    </label>
+                </div>
+            </div>
+        </div>
+    `;
+
+    const list = section.querySelector('.usage-pending-list');
+    accounts.forEach(account => list.appendChild(createPendingRestoreRow(account)));
+
+    const toggleBtn = section.querySelector('.btn-pending-toggle');
+    toggleBtn.onclick = (e) => {
+        e.stopPropagation();
+        pendingRestoreState.collapsed = !pendingRestoreState.collapsed;
+        updatePendingRestoreSection(pendingAccounts);
+    };
+
+    const verifyBtn = section.querySelector('.btn-pending-verify-all');
+    verifyBtn.onclick = async (e) => {
+        e.stopPropagation();
+        verifyBtn.disabled = true;
+        try {
+            await refreshUsage();
+        } finally {
+            if (verifyBtn.isConnected) verifyBtn.disabled = false;
+        }
+    };
+
+    const prevBtn = section.querySelector('.btn-pending-prev');
+    if (prevBtn) {
+        prevBtn.onclick = (e) => {
+            e.stopPropagation();
+            if (pendingRestoreState.page > 1) {
+                pendingRestoreState.page -= 1;
+                updatePendingRestoreSection(pendingAccounts);
+            }
+        };
+    }
+
+    const nextBtn = section.querySelector('.btn-pending-next');
+    if (nextBtn) {
+        nextBtn.onclick = (e) => {
+            e.stopPropagation();
+            if (pendingRestoreState.page < totalPages) {
+                pendingRestoreState.page += 1;
+                updatePendingRestoreSection(pendingAccounts);
+            }
+        };
+    }
+
+    const pageSizeSelect = section.querySelector('.usage-pending-page-size');
+    if (pageSizeSelect) {
+        pageSizeSelect.onchange = (e) => {
+            pendingRestoreState.pageSize = Math.max(1, Number(e.target.value) || 20);
+            pendingRestoreState.page = 1;
+            updatePendingRestoreSection(pendingAccounts);
+        };
+    }
+
+    return section;
+}
+
+function updatePendingRestoreSection(pendingAccounts) {
+    const container = document.getElementById('usageContent');
+    if (!container) return;
+
+    const existing = container.querySelector('[data-section="pending-restore"]');
+    if (!Array.isArray(pendingAccounts) || pendingAccounts.length === 0) {
+        if (existing) existing.remove();
+        return;
+    }
+
+    const section = createPendingRestoreSection(pendingAccounts);
+    if (existing) {
+        container.replaceChild(section, existing);
+    } else {
+        container.insertBefore(section, container.firstChild);
+    }
+}
 
 /**
  * 更新提供商配置
@@ -21,7 +304,9 @@ export function updateUsageProviderConfigs(configs) {
  */
 export function initUsageManager() {
     const refreshBtn = document.getElementById('refreshUsageBtn');
+    const syncBtn = document.getElementById('syncProviderPoolUsageBtn');
     bindOnce(refreshBtn, 'click', refreshUsage, 'refreshUsage');
+    bindOnce(syncBtn, 'click', syncProviderPoolUsage, 'syncProviderPoolUsage');
 }
 
 /**
@@ -100,6 +385,7 @@ export async function loadUsage() {
         if (loadingEl) loadingEl.style.display = 'none';
         renderUsageData(data, contentEl);
         updateTimeInfo(data);
+        updateQuotaRulesInfo(data);
     } catch (error) {
         console.error('获取用量数据失败:', error);
         if (loadingEl) loadingEl.style.display = 'none';
@@ -132,6 +418,7 @@ export async function refreshUsage() {
         // 渲染数据
         renderUsageData(data, document.getElementById('usageContent'));
         updateTimeInfo(data);
+        updateQuotaRulesInfo(data);
         
         // 成功提示
         showToast(t('common.refresh.success'), 'success');
@@ -140,6 +427,44 @@ export async function refreshUsage() {
         showToast(t('common.error'), error.message || t('common.requestFailed'), 'error');
     } finally {
         if (refreshBtn) refreshBtn.disabled = false;
+    }
+}
+
+/**
+ * 同步账号池用量
+ */
+export async function syncProviderPoolUsage() {
+    const syncBtn = document.getElementById('syncProviderPoolUsageBtn');
+    if (syncBtn) syncBtn.disabled = true;
+
+    try {
+        showToast(t('usage.syncProviderPoolLoading'), 'info');
+
+        const response = await fetch('/api/usage/sync-provider-pool', {
+            method: 'POST',
+            headers: getAuthHeaders()
+        });
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(errorData.error?.message || errorData.message || `HTTP ${response.status}`);
+        }
+
+        const data = await response.json();
+        renderUsageData(data, document.getElementById('usageContent'));
+        updateTimeInfo(data);
+        updateQuotaRulesInfo(data);
+
+        const syncStats = data?.syncStats || {};
+        const added = Number(syncStats.addedCount || 0);
+        const existing = Number(syncStats.existingCount || 0);
+        const skipped = Number(syncStats.disabledSkippedCount || 0);
+        showToast(t('common.success'), t('usage.syncProviderPoolSuccess', { added, existing, skipped }), 'success');
+    } catch (error) {
+        console.error('同步账号池失败:', error);
+        showToast(error.message || t('common.requestFailed'), 'error');
+    } finally {
+        if (syncBtn) syncBtn.disabled = false;
     }
 }
 
@@ -163,7 +488,12 @@ export async function refreshSingleInstanceUsage(providerType, uuid, displayName
         
         // 局部更新该实例的卡片
         if (data && data.uuid) {
-            updateSingleInstanceCard(providerType, data);
+            const updated = updateSingleInstanceCard(providerType, data);
+            updatePendingRestoreSection(data.pendingRestoreAccounts || []);
+            updateQuotaRulesInfo(data);
+            if (!updated) {
+                await loadUsage();
+            }
             showToast(t('common.refresh.success'), 'success');
         } else {
             await loadUsage();
@@ -179,13 +509,13 @@ export async function refreshSingleInstanceUsage(providerType, uuid, displayName
  */
 function updateSingleInstanceCard(providerType, instanceData) {
     const container = document.getElementById('usageContent');
-    if (!container) return;
+    if (!container) return false;
 
     const group = container.querySelector(`.usage-provider-group[data-provider="${providerType}"]`);
-    if (!group) return;
+    if (!group) return false;
 
     const grid = group.querySelector('.usage-cards-grid');
-    if (!grid) return;
+    if (!grid) return false;
 
     // 找到该实例的卡片。卡片本身没有 data-uuid 属性，我们需要通过内部的 span 查找或添加它
     // 在 createInstanceUsageCard 中，我们可以为卡片添加 data-uuid
@@ -204,7 +534,10 @@ function updateSingleInstanceCard(providerType, instanceData) {
         const newCard = createInstanceUsageCard(instanceData, providerType);
         newCard.classList.toggle('collapsed', isCollapsed);
         grid.replaceChild(newCard, targetCard);
+        return true;
     }
+
+    return false;
 }
 
 /**
@@ -223,7 +556,9 @@ export async function refreshProviderUsage(providerType) {
         // 如果返回了全量数据或该提供商的数据，尝试局部更新
         if (data.providers && data.providers[providerType]) {
             updateSingleProviderGroup(providerType, data.providers[providerType]);
+            updatePendingRestoreSection(data.pendingRestoreAccounts || []);
             updateTimeInfo(data);
+            updateQuotaRulesInfo(data);
         } else {
             await loadUsage();
         }
@@ -243,7 +578,7 @@ function updateSingleProviderGroup(providerType, providerData) {
     if (!container) return;
 
     const existingGroup = container.querySelector(`.usage-provider-group[data-provider="${providerType}"]`);
-    const instances = (providerData.instances || []).filter(i => !i.isDisabled && !i.error?.includes('not initialized'));
+    const instances = (providerData.instances || []).filter(i => !i.isDisabled && !i.error?.includes('not initialized') && !i.hiddenFromUsageList && !i.localQuotaLedger?.hiddenFromUsageList);
     
     if (instances.length === 0) {
         if (existingGroup) existingGroup.remove();
@@ -294,16 +629,22 @@ function renderUsageData(data, container) {
     if (!container) return;
     container.innerHTML = '';
 
-    if (!data?.providers || Object.keys(data.providers).length === 0) {
+    const pendingAccounts = Array.isArray(data?.pendingRestoreAccounts) ? data.pendingRestoreAccounts : [];
+
+    if ((!data?.providers || Object.keys(data.providers).length === 0) && pendingAccounts.length === 0) {
         container.innerHTML = `<div class="usage-empty"><p>${t('usage.noData')}</p></div>`;
         return;
     }
 
     const groupedInstances = {};
-    for (const [type, pData] of Object.entries(data.providers)) {
+    for (const [type, pData] of Object.entries(data.providers || {})) {
         if (currentProviderConfigs?.find(c => c.id === type)?.visible === false) continue;
-        const valid = (pData.instances || []).filter(i => !i.isDisabled && !i.error?.includes('not initialized'));
+        const valid = (pData.instances || []).filter(i => !i.isDisabled && !i.error?.includes('not initialized') && !i.hiddenFromUsageList && !i.localQuotaLedger?.hiddenFromUsageList);
         if (valid.length > 0) groupedInstances[type] = valid;
+    }
+
+    if (pendingAccounts.length > 0) {
+        container.appendChild(createPendingRestoreSection(pendingAccounts));
     }
 
     const displayOrder = currentProviderConfigs ? currentProviderConfigs.map(c => c.id) : Object.keys(groupedInstances);

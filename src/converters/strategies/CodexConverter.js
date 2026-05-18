@@ -231,6 +231,9 @@ export class CodexConverter extends BaseConverter {
                 return item;
             });
         }
+        if (!codexRequest.instructions?.trim()) {
+            codexRequest.instructions = 'You are a helpful assistant.';
+        }
         // 确保 text.format 是对象而非字符串
         if (codexRequest.text?.format && typeof codexRequest.text.format === 'string') {
             const fmt = codexRequest.text.format;

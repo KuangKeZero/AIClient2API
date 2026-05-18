@@ -461,7 +461,11 @@ class CodexAuth {
             };
         } catch (error) {
             logger.error(`${CODEX_OAUTH_CONFIG.logPrefix} Token refresh failed:`, error.response?.data || error.message);
-            throw new Error(`Failed to refresh tokens: ${error.response?.data?.error_description || error.message}`);
+            const wrappedError = new Error(`Failed to refresh tokens: ${error.response?.data?.error_description || error.message}`);
+            wrappedError.status = error.response?.status || error.status || error.statusCode;
+            wrappedError.response = error.response;
+            wrappedError.cause = error;
+            throw wrappedError;
         }
     }
 
@@ -683,6 +687,13 @@ export async function batchImportCodexTokensStream(tokens, onProgress = null, sk
             const claims = auth.parseJWT(tokenData.id_token);
             const accountId = claims['https://api.openai.com/auth']?.chatgpt_account_id || claims.sub;
             const email = claims.email;
+            const planType = tokenData.plan_type ||
+                tokenData.planType ||
+                tokenData.account_plan ||
+                tokenData.accountPlan ||
+                tokenData.subscription_type ||
+                tokenData.subscriptionType ||
+                null;
 
             // 检查重复
             if (!skipDuplicateCheck) {
@@ -716,6 +727,7 @@ export async function batchImportCodexTokensStream(tokens, onProgress = null, sk
                 last_refresh: new Date().toISOString(),
                 email: email,
                 type: 'codex',
+                ...(planType ? { plan_type: planType } : {}),
                 expired: new Date(Date.now() + (tokenData.expires_in || 3600) * 1000).toISOString()
             };
 

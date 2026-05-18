@@ -4,6 +4,11 @@ import logger from '../utils/logger.js';
 import { MODEL_PROVIDER, getProtocolPrefix } from '../utils/common.js';
 import { withFileLock, atomicWriteFile } from '../utils/file-lock.js';
 import { convertData } from '../convert/convert.js';
+import {
+    AccountQuotaLedger,
+    extractTokenUsage,
+    isQuotaLike429
+} from './account-quota-ledger.js';
 
 import {
     getConfiguredSupportedModels,
@@ -66,6 +71,7 @@ export class ProviderPoolManager {
         this.globalConfig = options.globalConfig || {}; // 存储全局配置
         this.providerStatus = {}; // Tracks health and usage for each provider instance
         this.roundRobinIndex = {}; // Tracks the current index for round-robin selection for each provider type
+        this.accountQuotaLedger = new AccountQuotaLedger(this.globalConfig);
         // 使用 ?? 运算符确保 0 也能被正确设置，而不是被 || 替换为默认值
         this.maxErrorCount = options.maxErrorCount ?? 10; // Default to 10 errors before marking unhealthy
         this.healthCheckInterval = options.healthCheckInterval ?? 10 * 60 * 1000; // Default to 10 minutes
@@ -513,6 +519,7 @@ export class ProviderPoolManager {
 
         } catch (error) {
             this._log('error', `Token refresh failed for node ${this._getDisplayName(config)}: ${error.message}`);
+            const authFailure = this._recordAccountAuthFailure(providerType, config.uuid, error, 'token_refresh');
             
             // 记录错误信息
             config.lastErrorTime = new Date().toISOString();
@@ -520,6 +527,13 @@ export class ProviderPoolManager {
             
             // 增加错误计数（用于普通的健康检查参考，虽然刷新错误主要参考 refreshCount）
             config.errorCount = (config.errorCount || 0) + 1;
+
+            if (authFailure.handled) {
+                if (!authFailure.shouldDelete) {
+                    this.markProviderUnhealthyImmediately(providerType, config, `Authentication failed during token refresh: ${error.message}`);
+                }
+                throw error;
+            }
 
             // 只有当刷新重试次数达到上限（5次）时，才标记为不健康
             // 注意：refreshCount 在进入本方法后的 try 块前已经自增（L466）
@@ -622,6 +636,303 @@ export class ProviderPoolManager {
         const freshBonus = isFresh ? (now - lastHealthCheckTime) : 0;
 
         return baseScore + usageScore + sequenceScore + loadScore + freshBonus;
+    }
+
+    _isConcurrencyFull(providerStatus) {
+        const concurrencyLimit = parseInt(providerStatus?.config?.concurrencyLimit || 0);
+        if (concurrencyLimit <= 0) return false;
+        return (providerStatus?.state?.activeCount || 0) >= concurrencyLimit;
+    }
+
+    _filterByQuotaLedger(providerType, providers, now = Date.now()) {
+        if (!this.accountQuotaLedger?.enabled) {
+            return providers.filter(provider => !this._isConcurrencyFull(provider));
+        }
+
+        const candidates = [];
+        const skippedByLedger = [];
+
+        for (const provider of providers) {
+            if (this._isConcurrencyFull(provider)) {
+                this._log('debug', `[AccountQuotaLedger] Skipping ${this._getDisplayName(provider.config)} (${providerType}): concurrency full`);
+                continue;
+            }
+
+            const decision = this.accountQuotaLedger.getRoutingDecision(providerType, provider.config, now);
+            if (decision.refreshReason) {
+                this._scheduleAccountUsageRefresh(providerType, provider.config, decision.refreshReason);
+            }
+
+            if (decision.skip) {
+                skippedByLedger.push({ provider, decision });
+                this._syncProviderWithAccountQuota(providerType, provider.config, decision.account, decision.reason);
+                this._log('info', `[AccountQuotaLedger] Skipping ${this._getDisplayName(provider.config)} (${providerType}): ${decision.reason}`);
+                continue;
+            }
+
+            candidates.push(provider);
+        }
+
+        if (this.accountQuotaLedger.shouldRefreshForPoolPressure(providers.length, candidates.length)) {
+            this._log('warn', `[AccountQuotaLedger] Available accounts for ${providerType} are low (${candidates.length}/${providers.length}); scheduling rescue usage checks`);
+            const rescueTargets = skippedByLedger.length > 0
+                ? skippedByLedger.map(item => item.provider)
+                : providers.filter(provider => !provider.config.isDisabled);
+            for (const provider of rescueTargets) {
+                this._scheduleAccountUsageRefresh(providerType, provider.config, 'pool_exhausted');
+            }
+        }
+
+        return candidates;
+    }
+
+    _getErrorStatus(error) {
+        const numericStatus = Number(error?.response?.status || error?.status || error?.statusCode || 0);
+        if (numericStatus) return numericStatus;
+
+        const message = String(error?.message || '').toLowerCase();
+        if (
+            message.includes('status code 401') ||
+            message.includes('status code 403') ||
+            message.includes('unauthorized') ||
+            message.includes('forbidden') ||
+            message.includes('re-authenticate')
+        ) {
+            return message.includes('403') || message.includes('forbidden') ? 403 : 401;
+        }
+
+        return 0;
+    }
+
+    _recordAccountAuthFailure(providerType, uuid, error, source = 'request') {
+        const status = this._getErrorStatus(error);
+        if (status !== 401 && status !== 403) {
+            return { handled: false, status };
+        }
+
+        const result = this.accountQuotaLedger.record401(providerType, uuid, {
+            message: `${source}: ${error?.message || 'authentication failed'}`
+        });
+
+        if (result.shouldDelete) {
+            this.removeProvider(providerType, uuid, `three recent ${status} responses`);
+        }
+
+        return {
+            handled: true,
+            status,
+            shouldDelete: result.shouldDelete,
+            account: result.account
+        };
+    }
+
+    _syncProviderWithAccountQuota(providerType, providerConfig, account, reason = 'quota') {
+        if (!this.accountQuotaLedger?.enabled || !providerConfig?.uuid || !account || providerConfig.isDisabled) {
+            return false;
+        }
+
+        const threshold = this.accountQuotaLedger.getThresholdForAccount(account);
+        const estimated = Number(account.estimatedUsagePercent || 0);
+        const disabledUntilMs = account.disabledUntil ? Date.parse(account.disabledUntil) : 0;
+        const isCoolingDown = disabledUntilMs && disabledUntilMs > Date.now();
+        if (estimated < threshold && !isCoolingDown) {
+            return false;
+        }
+
+        const recoveryTime = account.disabledUntil || account.resetAt || account.refresh?.nextVerifyAt || null;
+        const percentText = Number.isFinite(estimated) ? estimated.toFixed(2) : 'unknown';
+        this.markProviderUnhealthyWithRecoveryTime(
+            providerType,
+            providerConfig,
+            `[AccountQuotaLedger] ${reason}: usage ${percentText}% >= threshold ${threshold}%`,
+            recoveryTime
+        );
+        return true;
+    }
+
+    _syncAccountQuotaLedgerStatuses(providerType = null) {
+        if (!this.accountQuotaLedger?.enabled) return;
+
+        const types = providerType ? [providerType] : Object.keys(this.providerStatus || {});
+        for (const type of types) {
+            for (const provider of this.providerStatus[type] || []) {
+                const decision = this.accountQuotaLedger.getRoutingDecision(type, provider.config);
+                if (decision.skip) {
+                    this._syncProviderWithAccountQuota(type, provider.config, decision.account, decision.reason);
+                }
+            }
+        }
+    }
+
+    _scheduleAccountUsageRefresh(providerType, providerConfig, reason, options = {}) {
+        if (!this.accountQuotaLedger?.enabled || !providerConfig?.uuid) return;
+        if (providerConfig.isDisabled && !options.force) return;
+
+        const queued = this.accountQuotaLedger.requestRefresh(providerType, providerConfig.uuid, reason, Date.now(), options);
+        if (!queued?.queued) return;
+
+        const refreshImmediate = setImmediate(() => {
+            this._refreshAccountUsage(providerType, providerConfig.uuid, reason).catch(error => {
+                this._log('warn', `[AccountQuotaLedger] Usage refresh failed for ${this._getDisplayName(providerConfig)} (${providerType}): ${error.message}`);
+            });
+        });
+        refreshImmediate.unref?.();
+    }
+
+    async _refreshAccountUsage(providerType, uuid, reason = 'manual') {
+        if (!this.accountQuotaLedger?.enabled || !uuid) return null;
+        const provider = this._findProvider(providerType, uuid);
+        if (!provider) {
+            this.accountQuotaLedger.markRefreshFailed(providerType, uuid, reason, 'provider not found');
+            return null;
+        }
+
+        try {
+            const { usageService } = await import('../services/usage-service.js');
+            if (!usageService.supportsProvider(providerType)) {
+                this.accountQuotaLedger.markRefreshFailed(providerType, uuid, reason, `unsupported usage provider: ${providerType}`);
+                return null;
+            }
+
+            const formattedUsage = await usageService.getFormattedUsage(providerType, uuid);
+            const account = this.accountQuotaLedger.applyRealUsage(providerType, uuid, formattedUsage);
+            const reachedThreshold = account && account.estimatedUsagePercent >= this.accountQuotaLedger.getThresholdForAccount(account);
+
+            if (reachedThreshold) {
+                this._syncProviderWithAccountQuota(providerType, provider.config, account, 'real_usage_threshold');
+            } else if (account) {
+                const wasHealthy = provider.config.isHealthy;
+                provider.config.isHealthy = true;
+                provider.config.errorCount = 0;
+                provider.config.lastErrorTime = null;
+                provider.config.lastErrorMessage = null;
+                provider.config.scheduledRecoveryTime = null;
+                provider.config.needsRefresh = false;
+                provider.config.refreshCount = 0;
+                provider.config.lastHealthCheckTime = new Date().toISOString();
+                if (!wasHealthy) {
+                    this._logHealthStatusChange(providerType, provider.config, 'unhealthy', 'healthy', null);
+                }
+                this._debouncedSave(providerType);
+            }
+
+            this._log('info', `[AccountQuotaLedger] Real usage refreshed for ${this._getDisplayName(provider.config)} (${providerType}) reason=${reason}`);
+            return account;
+        } catch (error) {
+            const authFailure = this._recordAccountAuthFailure(providerType, uuid, error, 'usage_refresh');
+            if (authFailure.handled && !authFailure.shouldDelete) {
+                this.markProviderUnhealthyImmediately(providerType, provider.config, `Authentication failed during usage refresh: ${error.message}`);
+            }
+            this.accountQuotaLedger.markRefreshFailed(providerType, uuid, reason, error.message);
+            throw error;
+        }
+    }
+
+    refreshInitialAccountQuotaLedgers() {
+        if (!this.accountQuotaLedger?.enabled) return;
+        for (const providerType of Object.keys(this.providerStatus || {})) {
+            for (const provider of this.providerStatus[providerType] || []) {
+                const decision = this.accountQuotaLedger.getRoutingDecision(providerType, provider.config);
+                if (decision.refreshReason === 'first_seen') {
+                    this._scheduleAccountUsageRefresh(providerType, provider.config, 'first_seen');
+                }
+            }
+        }
+    }
+
+    recordAccountRequestSuccess(providerType, uuid, details = {}) {
+        if (!this.accountQuotaLedger?.enabled || !providerType || !uuid) return null;
+        const usage = details.usage?.totalTokens !== undefined
+            ? details.usage
+            : extractTokenUsage(details.usage, details.nativeResponse, details.clientResponse);
+        const result = this.accountQuotaLedger.recordEstimatedUsage(providerType, uuid, {
+            ...details,
+            usage
+        });
+
+        if (result?.decision?.skip || result?.decision?.refreshReason) {
+            const provider = this._findProvider(providerType, uuid);
+            if (provider) {
+                if (result.decision.skip) {
+                    this._syncProviderWithAccountQuota(providerType, provider.config, result.account, result.decision.reason || 'estimated_threshold');
+                }
+                if (result.decision.refreshReason) {
+                    this._scheduleAccountUsageRefresh(providerType, provider.config, result.decision.refreshReason);
+                }
+            }
+        }
+
+        return result;
+    }
+
+    recordAccountRequestFailure(providerType, uuid, error, details = {}) {
+        if (!this.accountQuotaLedger?.enabled || !providerType || !uuid || !error) {
+            return { handled: false };
+        }
+
+        const status = this._getErrorStatus(error);
+        if (status === 401 || status === 403) {
+            const result = this._recordAccountAuthFailure(providerType, uuid, error, 'request');
+            return {
+                handled: true,
+                status,
+                shouldSwitchCredential: true,
+                credentialMarkedUnhealthy: true,
+                skipErrorCount: true,
+                deleted: result.shouldDelete
+            };
+        }
+
+        if (status === 429) {
+            const provider = this._findProvider(providerType, uuid);
+            const account = this.accountQuotaLedger.getAccount(providerType, uuid);
+            const result = this.accountQuotaLedger.record429(providerType, uuid, {
+                error,
+                retryAfterMs: details.retryAfterMs,
+                retryAfter: details.retryAfter,
+                quotaLike: details.quotaLike ?? isQuotaLike429(error),
+                resetAt: details.resetAt || account?.resetAt
+            });
+
+            if (result?.shouldRefresh && provider) {
+                this._scheduleAccountUsageRefresh(providerType, provider.config, result.refreshReason || 'quota_429', { force: true });
+            }
+
+            return {
+                handled: true,
+                status,
+                shouldSwitchCredential: true,
+                credentialMarkedUnhealthy: true,
+                skipErrorCount: true,
+                quotaLike: result?.quotaLike,
+                retryAfterMs: result?.retryAfterMs
+            };
+        }
+
+        return { handled: false, status };
+    }
+
+    removeProvider(providerType, uuid, reason = null) {
+        if (!providerType || !uuid) return false;
+
+        const providers = this.providerStatus[providerType] || [];
+        const index = providers.findIndex(provider => provider.uuid === uuid);
+        if (index === -1) return false;
+
+        const [removed] = providers.splice(index, 1);
+        const poolArray = this.providerPools[providerType];
+        if (Array.isArray(poolArray)) {
+            const poolIndex = poolArray.findIndex(provider => provider.uuid === uuid);
+            if (poolIndex !== -1) {
+                poolArray.splice(poolIndex, 1);
+            }
+        }
+
+        invalidateServiceAdapter(providerType, uuid);
+        this.accountQuotaLedger?.markDeleted(providerType, uuid, reason);
+        this._log('warn', `[AccountQuotaLedger] Removed provider ${this._getDisplayName(removed.config)} (${providerType}) after ${reason || 'account ledger deletion signal'}`);
+        this._debouncedSave(providerType);
+        return true;
     }
 
     /**
@@ -851,6 +1162,7 @@ export class ProviderPoolManager {
                     providerConfig.lastHealthCheckModel = providerConfig.lastHealthCheckModel || null;
                     providerConfig.lastErrorMessage = providerConfig.lastErrorMessage || null;
                     providerConfig.customName = providerConfig.customName || null;
+                    this.accountQuotaLedger.ensureAccount(providerType, providerConfig);
 
                     this.providerStatus[providerType].push({
                         config: providerConfig,
@@ -870,6 +1182,7 @@ export class ProviderPoolManager {
             // 确保初始化时的默认值补全也能写盘
             this._debouncedSave(providerType);
         }
+        this._syncAccountQuotaLedgerStatuses();
         this._log('info', `Initialized provider statuses: ok (maxErrorCount: ${this.maxErrorCount})`);
     }
 
@@ -1025,6 +1338,7 @@ export class ProviderPoolManager {
         let availableAndHealthyProviders = availableProviders.filter(p =>
             p.config.isHealthy && !p.config.isDisabled && !p.config.needsRefresh
         );
+        availableAndHealthyProviders = this._filterByQuotaLedger(providerType, availableAndHealthyProviders, now);
 
         // 如果指定了模型，则排除不支持该模型的提供商
         if (requestedModel) {
@@ -1727,6 +2041,13 @@ export class ProviderPoolManager {
 
         const provider = this._findProvider(providerType, providerConfig.uuid);
         if (provider) {
+            const ledgerDecision = this.accountQuotaLedger?.getRoutingDecision(providerType, provider.config);
+            if (ledgerDecision?.skip) {
+                this._syncProviderWithAccountQuota(providerType, provider.config, ledgerDecision.account, ledgerDecision.reason);
+                this._log('info', `[AccountQuotaLedger] Refusing to mark ${this._getDisplayName(provider.config)} (${providerType}) healthy while ledger decision is ${ledgerDecision.reason}`);
+                return;
+            }
+
             const wasHealthy = provider.config.isHealthy;
             provider.config.isHealthy = true;
             provider.config.errorCount = 0;
@@ -1938,6 +2259,13 @@ export class ProviderPoolManager {
                 if (config.scheduledRecoveryTime && !config.isHealthy) {
                     const recoveryTime = new Date(config.scheduledRecoveryTime);
                     if (now >= recoveryTime) {
+                        const ledgerDecision = this.accountQuotaLedger?.getRoutingDecision(type, config, now.getTime());
+                        if (ledgerDecision?.refreshReason) {
+                            this._scheduleAccountUsageRefresh(type, config, ledgerDecision.refreshReason);
+                            this._log('info', `[AccountQuotaLedger] Delaying recovery for ${this._getDisplayName(config)} (${type}) until usage refresh confirms availability.`);
+                            continue;
+                        }
+
                         this._log('info', `Auto-recovering provider ${this._getDisplayName(config)} (${type}). Scheduled recovery time reached: ${recoveryTime.toISOString()}`);
                         
                         // 恢复健康状态
@@ -2313,6 +2641,7 @@ export class ProviderPoolManager {
         this.saveTimer = setTimeout(() => {
             this._flushPendingSaves();
         }, this.saveDebounceTime);
+        this.saveTimer.unref?.();
     }
     
     /**
@@ -2385,4 +2714,3 @@ export class ProviderPoolManager {
     }
 
 }
-

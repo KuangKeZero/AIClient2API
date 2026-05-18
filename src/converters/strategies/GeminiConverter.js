@@ -20,6 +20,7 @@ import {
     generateResponseInProgress,
     generateOutputItemAdded,
     generateContentPartAdded,
+    generateOutputTextDelta,
     generateOutputTextDone,
     generateContentPartDone,
     generateOutputItemDone,
@@ -205,14 +206,14 @@ export class GeminiConverter extends BaseConverter {
     /**
      * 转换流式响应块
      */
-    convertStreamChunk(chunk, targetProtocol, model) {
+    convertStreamChunk(chunk, targetProtocol, model, requestId) {
         switch (targetProtocol) {
             case MODEL_PROTOCOL_PREFIX.OPENAI:
                 return this.toOpenAIStreamChunk(chunk, model);
             case MODEL_PROTOCOL_PREFIX.CLAUDE:
                 return this.toClaudeStreamChunk(chunk, model);
             case MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES:
-                return this.toOpenAIResponsesStreamChunk(chunk, model);
+                return this.toOpenAIResponsesStreamChunk(chunk, model, requestId);
             case MODEL_PROTOCOL_PREFIX.CODEX:
                 return this.toCodexStreamChunk(chunk, model);
             default:
@@ -1269,13 +1270,7 @@ export class GeminiConverter extends BaseConverter {
                     const textParts = parts.filter(part => part && typeof part.text === 'string');
                     if (textParts.length > 0) {
                         const text = textParts.map(part => part.text).join('');
-                        events.push({
-                            delta: text,
-                            item_id: `msg_${uuidv4().replace(/-/g, '')}`,
-                            output_index: 0,
-                            sequence_number: 3,
-                            type: "response.output_text.delta"
-                        });
+                        events.push(generateOutputTextDelta(responseId, text));
                     }
                 }
                 
@@ -1311,13 +1306,7 @@ export class GeminiConverter extends BaseConverter {
 
         // 向后兼容：处理字符串格式
         if (typeof geminiChunk === 'string') {
-            events.push({
-                delta: geminiChunk,
-                item_id: `msg_${uuidv4().replace(/-/g, '')}`,
-                output_index: 0,
-                sequence_number: 3,
-                type: "response.output_text.delta"
-            });
+            events.push(generateOutputTextDelta(responseId, geminiChunk));
         }
 
         return events;

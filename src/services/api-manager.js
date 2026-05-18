@@ -242,6 +242,13 @@ async function handleImageGenerationRequest(req, res, currentConfig, providerPoo
         }
 
         const clientResponse = { created: Math.floor(Date.now() / 1000), data };
+        if (providerPoolManager && slotProviderType && slotUuid) {
+            providerPoolManager.recordAccountRequestSuccess(slotProviderType, slotUuid, {
+                model,
+                nativeResponse: responses.length === 1 ? responses[0] : responses,
+                clientResponse
+            });
+        }
 
         // 监控钩子：内容生成后与一元响应
         if (currentConfig._monitorRequestId) {
@@ -280,14 +287,22 @@ async function handleImageGenerationRequest(req, res, currentConfig, providerPoo
 
         const shouldSwitchCredential = error.shouldSwitchCredential === true;
         let credentialMarkedUnhealthy = error.credentialMarkedUnhealthy === true;
+        const ledgerFailure = providerPoolManager && slotProviderType && slotUuid
+            ? providerPoolManager.recordAccountRequestFailure(slotProviderType, slotUuid, error, { model })
+            : null;
+        if (ledgerFailure?.credentialMarkedUnhealthy) {
+            credentialMarkedUnhealthy = true;
+        }
+        const effectiveSkipErrorCount = error.skipErrorCount === true || ledgerFailure?.skipErrorCount === true;
+        const effectiveShouldSwitchCredential = shouldSwitchCredential || ledgerFailure?.shouldSwitchCredential === true;
 
         if (providerPoolManager && slotUuid) {
-            const rateLimitRecoveryTime = getRateLimitCooldownRecoveryTime(error, CONFIG);
+            const rateLimitRecoveryTime = ledgerFailure?.handled ? null : getRateLimitCooldownRecoveryTime(error, CONFIG);
             if (rateLimitRecoveryTime) {
                 logger.info(`[Provider Pool] Applying 429 cooldown for ${slotProviderType} (${slotUuid})`);
                 providerPoolManager.markProviderUnhealthyWithRecoveryTime(slotProviderType, {uuid: slotUuid}, '429 Too Many Requests - short cooldown', rateLimitRecoveryTime);
                 credentialMarkedUnhealthy = true;
-            } else if (!credentialMarkedUnhealthy && !error.skipErrorCount) {
+            } else if (!credentialMarkedUnhealthy && !effectiveSkipErrorCount) {
                 if (error.response?.status !== 400) {
                     logger.info(`[Provider Pool] Marking ${slotProviderType} as unhealthy due to image generation error (status: ${error.response?.status || 'unknown'})`);
                     providerPoolManager.markProviderUnhealthy(slotProviderType, {uuid: slotUuid}, error.message);
@@ -296,7 +311,7 @@ async function handleImageGenerationRequest(req, res, currentConfig, providerPoo
             }
         }
 
-        if (shouldSwitchCredential && !credentialMarkedUnhealthy) {
+        if (effectiveShouldSwitchCredential && !credentialMarkedUnhealthy) {
             credentialMarkedUnhealthy = true;
         }
 
@@ -429,11 +444,12 @@ function parseMultipartForm(req) {
 async function handleImageEditsRequest(req, res, currentConfig, providerPoolManager) {
     let slotProviderType = null;
     let slotUuid = null;
+    let model = null;
 
     try {
         const { fields, files } = await parseMultipartForm(req);
 
-        const model = fields.model || 'gpt-image-2';
+        model = fields.model || 'gpt-image-2';
         const prompt = fields.prompt;
         const response_format = fields.response_format || 'b64_json';
         const size = fields.size;
@@ -553,6 +569,13 @@ async function handleImageEditsRequest(req, res, currentConfig, providerPoolMana
         }
 
         const clientResponse = { created: Math.floor(Date.now() / 1000), data };
+        if (providerPoolManager && slotProviderType && slotUuid) {
+            providerPoolManager.recordAccountRequestSuccess(slotProviderType, slotUuid, {
+                model,
+                nativeResponse: responses.length === 1 ? responses[0] : responses,
+                clientResponse
+            });
+        }
 
         // 监控钩子
         if (currentConfig._monitorRequestId) {
@@ -588,6 +611,9 @@ async function handleImageEditsRequest(req, res, currentConfig, providerPoolMana
         res.end(JSON.stringify(clientResponse));
     } catch (error) {
         logger.error('[Image Edits] Error:', error.message);
+        if (providerPoolManager && slotProviderType && slotUuid) {
+            providerPoolManager.recordAccountRequestFailure(slotProviderType, slotUuid, error, { model });
+        }
         if (!res.writableEnded) {
             res.writeHead(500, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: { message: error.message, type: 'server_error' } }));

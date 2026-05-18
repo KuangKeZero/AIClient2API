@@ -362,6 +362,7 @@ export async function initApiService(config, isReady = false) {
         }
         
         logger.info(`[Initialization] Provider pool initialization complete: ${totalInitialized} succeeded, ${totalFailed} failed.`);
+        providerPoolManager.refreshInitialAccountQuotaLedgers();
     } else {
         logger.info('[Initialization] No provider pools configured. Skipping node initialization.');
     }

@@ -30,10 +30,19 @@ import {
     generateResponseInProgress,
     generateOutputItemAdded,
     generateContentPartAdded,
+    generateOutputTextDelta,
     generateOutputTextDone,
     generateContentPartDone,
     generateOutputItemDone,
-    generateResponseCompleted
+    generateResponseCompleted,
+    startToolCall,
+    generateFunctionCallArgsDelta,
+    generateFunctionCallArgsDone,
+    finishToolCall,
+    generateFunctionCallOutputItemAdded,
+    generateFunctionCallOutputItemDone,
+    getPendingToolCalls,
+    nextSequenceNumber
 } from '../../providers/openai/openai-responses-core.mjs';
 
 /**
@@ -90,14 +99,14 @@ export class OpenAIConverter extends BaseConverter {
     /**
      * 转换流式响应块
      */
-    convertStreamChunk(chunk, targetProtocol, model) {
+    convertStreamChunk(chunk, targetProtocol, model, requestId) {
         switch (targetProtocol) {
             case MODEL_PROTOCOL_PREFIX.CLAUDE:
                 return this.toClaudeStreamChunk(chunk, model);
             case MODEL_PROTOCOL_PREFIX.GEMINI:
                 return this.toGeminiStreamChunk(chunk, model);
             case MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES:
-                return this.toOpenAIResponsesStreamChunk(chunk, model);
+                return this.toOpenAIResponsesStreamChunk(chunk, model, requestId);
             case MODEL_PROTOCOL_PREFIX.GROK:
                 return this.toGrokStreamChunk(chunk, model);
             default:
@@ -1721,7 +1730,7 @@ export class OpenAIConverter extends BaseConverter {
                 delta: delta.reasoning_content,
                 item_id: `thinking_${uuidv4().replace(/-/g, '')}`,
                 output_index: 0,
-                sequence_number: 3,
+                sequence_number: nextSequenceNumber(responseId),
                 type: "response.reasoning_summary_text.delta"
             });
         }
@@ -1733,52 +1742,48 @@ export class OpenAIConverter extends BaseConverter {
 
                 // 如果有 function.name，说明是工具调用开始
                 if (toolCall.function && toolCall.function.name) {
-                    events.push({
-                        item: {
-                            id: toolCall.id || `call_${uuidv4().replace(/-/g, '')}`,
-                            type: "function_call",
-                            name: toolCall.function.name,
-                            arguments: "",
-                            status: "in_progress"
-                        },
-                        output_index: outputIndex,
-                        sequence_number: 2,
-                        type: "response.output_item.added"
-                    });
+                    const started = startToolCall(responseId, toolCall.id, toolCall.function.name, outputIndex);
+                    events.push(generateFunctionCallOutputItemAdded(responseId, started, outputIndex));
                 }
 
                 // 如果有 function.arguments，说明是参数增量
                 if (toolCall.function && toolCall.function.arguments) {
-                    events.push({
-                        delta: toolCall.function.arguments,
-                        item_id: toolCall.id || `call_${uuidv4().replace(/-/g, '')}`,
-                        output_index: outputIndex,
-                        sequence_number: 3,
-                        type: "response.function_call_arguments.delta"
-                    });
+                    events.push(generateFunctionCallArgsDelta(
+                        responseId,
+                        toolCall.id || null,
+                        outputIndex,
+                        toolCall.function.arguments
+                    ));
                 }
             }
         }
 
         // 处理普通文本内容
         if (delta.content) {
-            events.push({
-                delta: delta.content,
-                item_id: `msg_${uuidv4().replace(/-/g, '')}`,
-                output_index: 0,
-                sequence_number: 3,
-                type: "response.output_text.delta"
-            });
+            events.push(generateOutputTextDelta(responseId, delta.content));
         }
 
         // 处理完成状态 - 调用 getOpenAIResponsesStreamChunkEnd
         if (choice.finish_reason) {
+            const pendingToolCalls = getPendingToolCalls(responseId);
+
+            if (pendingToolCalls.length > 0) {
+                for (const pendingToolCall of pendingToolCalls) {
+                    const outputIndex = pendingToolCall.outputIndex || 0;
+                    events.push(generateFunctionCallArgsDone(responseId, pendingToolCall.id, outputIndex));
+                    const finished = finishToolCall(responseId, pendingToolCall.id, outputIndex);
+                    if (finished) {
+                        events.push(generateFunctionCallOutputItemDone(responseId, finished, outputIndex));
+                    }
+                }
+            }
+
             events.push(
                 generateOutputTextDone(responseId),
                 generateContentPartDone(responseId),
-                generateOutputItemDone(responseId),
-                generateResponseCompleted(responseId)
+                generateOutputItemDone(responseId)
             );
+            events.push(generateResponseCompleted(responseId));
 
             // 如果有 usage 信息，更新最后一个事件
             if (openaiChunk.usage && events.length > 0) {

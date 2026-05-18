@@ -8,6 +8,7 @@ import { convertData, getOpenAIStreamChunkStop } from '../convert/convert.js';
 import { ProviderStrategyFactory } from './provider-strategies.js';
 import { getPluginManager } from '../core/plugin-manager.js';
 import { MODEL_PROTOCOL_PREFIX, MODEL_PROVIDER } from './constants.js';
+import { extractTokenUsage } from '../providers/account-quota-ledger.js';
 
 // ==================== 时间与时区 ====================
 
@@ -388,7 +389,7 @@ function appendCustomModelsToModelList(clientModelList, customEntries, providerT
  */
 export function getProtocolPrefix(provider) {
     // Special case for Codex - it needs its own protocol
-    if (provider === 'openai-codex-oauth') {
+    if (provider === MODEL_PROVIDER.CODEX_API || provider?.startsWith(MODEL_PROVIDER.CODEX_API + '-')) {
         return 'codex';
     }
 
@@ -601,10 +602,21 @@ function getPluginHookRequestId(config) {
     return config?._monitorRequestId || null;
 }
 
+function mergeTokenUsageForLedger(baseUsage, nextUsage) {
+    if (!nextUsage) return baseUsage;
+    return {
+        promptTokens: Math.max(baseUsage.promptTokens || 0, nextUsage.promptTokens || 0),
+        completionTokens: Math.max(baseUsage.completionTokens || 0, nextUsage.completionTokens || 0),
+        totalTokens: Math.max(baseUsage.totalTokens || 0, nextUsage.totalTokens || 0),
+        cachedTokens: Math.max(baseUsage.cachedTokens || 0, nextUsage.cachedTokens || 0)
+    };
+}
+
 export async function handleStreamRequest(res, service, model, requestBody, fromProvider, toProvider, PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, pooluuid, customName, retryContext = null) {
     let fullResponseText = '';
     let fullResponseJson = '';
     let fullOldResponseJson = '';
+    let ledgerUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0, cachedTokens: 0 };
     let responseClosed = false;
     let anyDataSent = retryContext?.anyDataSent || false; // 跟踪是否已向客户端发送过任何数据
     
@@ -673,6 +685,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
             const chunkToSend = needsConversion
                 ? convertData(nativeChunk, 'streamChunk', toProvider, fromProvider, model, streamRequestId)
                 : nativeChunk;
+            ledgerUsage = mergeTokenUsageForLedger(ledgerUsage, extractTokenUsage(nativeChunk, chunkToSend));
 
             // 监控钩子：流式响应分块
             const hookRequestId = getPluginHookRequestId(CONFIG);
@@ -782,6 +795,10 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         if (providerPoolManager && pooluuid) {
             const customNameDisplay = customName ? `, ${customName}` : '';
             logger.info(`[Provider Pool] Increasing usage count for ${toProvider} (${pooluuid}${customNameDisplay}) after successful stream request`);
+            providerPoolManager.recordAccountRequestSuccess(toProvider, pooluuid, {
+                model,
+                usage: ledgerUsage
+            });
             providerPoolManager.markProviderHealthy(toProvider, {
                 uuid: pooluuid
             });
@@ -824,8 +841,16 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         
         // 检查凭证是否已在底层被标记为不健康（避免重复标记）
         let credentialMarkedUnhealthy = error.credentialMarkedUnhealthy === true;
+        const ledgerFailure = providerPoolManager && pooluuid
+            ? providerPoolManager.recordAccountRequestFailure(toProvider, pooluuid, error, { model })
+            : null;
+        if (ledgerFailure?.credentialMarkedUnhealthy) {
+            credentialMarkedUnhealthy = true;
+        }
+        const effectiveSkipErrorCount = skipErrorCount || ledgerFailure?.skipErrorCount === true;
+        const effectiveShouldSwitchCredential = shouldSwitchCredential || ledgerFailure?.shouldSwitchCredential === true;
 
-        const rateLimitRecoveryTime = getRateLimitCooldownRecoveryTime(error, CONFIG);
+        const rateLimitRecoveryTime = ledgerFailure?.handled ? null : getRateLimitCooldownRecoveryTime(error, CONFIG);
         if (rateLimitRecoveryTime && providerPoolManager && pooluuid) {
             logger.info(`[Provider Pool] Applying 429 cooldown for ${toProvider} (${pooluuid}) until ${rateLimitRecoveryTime.toISOString()}`);
             providerPoolManager.markProviderUnhealthyWithRecoveryTime(toProvider, {
@@ -835,7 +860,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         }
         
         // 如果底层未标记，且不跳过错误计数，则在此处标记
-        if (!credentialMarkedUnhealthy && !skipErrorCount && providerPoolManager && pooluuid) {
+        if (!credentialMarkedUnhealthy && !effectiveSkipErrorCount && providerPoolManager && pooluuid) {
             // 400 报错码通常是请求参数问题，不记录为提供商错误
             if (error.response?.status === 400) {
                 logger.info(`[Provider Pool] Skipping unhealthy marking for ${toProvider} (${pooluuid}) due to status 400 (client error)`);
@@ -850,7 +875,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         }
         
         // 如果需要切换凭证（无论是否标记不健康），都设置标记以触发重试
-        if (shouldSwitchCredential && !credentialMarkedUnhealthy) {
+        if (effectiveShouldSwitchCredential && !credentialMarkedUnhealthy) {
             credentialMarkedUnhealthy = true; // 触发下面的重试逻辑
         }
         
@@ -1018,6 +1043,11 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
         if (providerPoolManager && pooluuid) {
             const customNameDisplay = customName ? `, ${customName}` : '';
             logger.info(`[Provider Pool] Increasing usage count for ${toProvider} (${pooluuid}${customNameDisplay}) after successful unary request`);
+            providerPoolManager.recordAccountRequestSuccess(toProvider, pooluuid, {
+                model,
+                nativeResponse,
+                clientResponse
+            });
             providerPoolManager.markProviderHealthy(toProvider, {
                 uuid: pooluuid
             });
@@ -1035,8 +1065,16 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
         
         // 检查凭证是否已在底层被标记为不健康（避免重复标记）
         let credentialMarkedUnhealthy = error.credentialMarkedUnhealthy === true;
+        const ledgerFailure = providerPoolManager && pooluuid
+            ? providerPoolManager.recordAccountRequestFailure(toProvider, pooluuid, error, { model })
+            : null;
+        if (ledgerFailure?.credentialMarkedUnhealthy) {
+            credentialMarkedUnhealthy = true;
+        }
+        const effectiveSkipErrorCount = skipErrorCount || ledgerFailure?.skipErrorCount === true;
+        const effectiveShouldSwitchCredential = shouldSwitchCredential || ledgerFailure?.shouldSwitchCredential === true;
 
-        const rateLimitRecoveryTime = getRateLimitCooldownRecoveryTime(error, CONFIG);
+        const rateLimitRecoveryTime = ledgerFailure?.handled ? null : getRateLimitCooldownRecoveryTime(error, CONFIG);
         if (rateLimitRecoveryTime && providerPoolManager && pooluuid) {
             logger.info(`[Provider Pool] Applying 429 cooldown for ${toProvider} (${pooluuid}) until ${rateLimitRecoveryTime.toISOString()}`);
             providerPoolManager.markProviderUnhealthyWithRecoveryTime(toProvider, {
@@ -1046,7 +1084,7 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
         }
         
         // 如果底层未标记，且不跳过错误计数，则在此处标记
-        if (!credentialMarkedUnhealthy && !skipErrorCount && providerPoolManager && pooluuid) {
+        if (!credentialMarkedUnhealthy && !effectiveSkipErrorCount && providerPoolManager && pooluuid) {
             // 400 报错码通常是请求参数问题，不记录为提供商错误
             if (error.response?.status === 400) {
                 logger.info(`[Provider Pool] Skipping unhealthy marking for ${toProvider} (${pooluuid}) due to status 400 (client error)`);
@@ -1061,7 +1099,7 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
         }
         
         // 如果需要切换凭证（无论是否标记不健康），都设置标记以触发重试
-        if (shouldSwitchCredential && !credentialMarkedUnhealthy) {
+        if (effectiveShouldSwitchCredential && !credentialMarkedUnhealthy) {
             credentialMarkedUnhealthy = true; // 触发下面的重试逻辑
         }
         

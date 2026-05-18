@@ -88,6 +88,26 @@ export async function initializeConfig(args = process.argv.slice(2), configFileP
         RATE_LIMIT_COOLDOWN_MS: 30000, // 429 限流默认冷却时间（毫秒）
         RATE_LIMIT_COOLDOWN_JITTER_MS: 5000, // 429 限流冷却随机抖动（毫秒）
         RATE_LIMIT_COOLDOWN_MAX_MS: 300000, // Retry-After 允许的最大冷却时间（毫秒）
+        ACCOUNT_QUOTA_LEDGER: {
+            enabled: true, // 本地账号额度账本：估算用量、减少真实用量刷新、路由跳过高风险账号
+            filePath: 'configs/account_quota_ledger.json',
+            freeThresholdPercent: 70,
+            plusThresholdPercent: 90,
+            defaultThresholdPercent: 85,
+            nearThresholdMarginPercent: 5,
+            minConfidenceForNearThreshold: 0.65,
+            shortCooldownMs: 30000,
+            longCooldownMs: 21600000,
+            lowFrequencyVerificationMs: 3600000,
+            authDeleteCount: 3,
+            poolLowAvailableCount: 1,
+            poolLowAvailableRatio: 0.2,
+            tokensPerPercent: {
+                free: 150000,
+                plus: 250000,
+                default: 250000
+            }
+        },
         CRON_NEAR_MINUTES: 15,
         CRON_REFRESH_TOKEN: false,
         LOGIN_EXPIRY: 3600, // 登录过期时间（秒），默认1小时

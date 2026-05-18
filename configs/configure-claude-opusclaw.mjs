@@ -1,0 +1,25 @@
+import fs from 'fs';
+import crypto from 'crypto';
+const path = '/app/configs/provider_pools.json';
+const keyPath = '/app/configs/.opusclaw_claude_key';
+const key = fs.readFileSync(keyPath, 'utf8').trim();
+fs.unlinkSync(keyPath);
+const ts = new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14);
+const backup = `${path}.bak-claude-opusclaw-${ts}`;
+const pools = JSON.parse(fs.readFileSync(path, 'utf8'));
+fs.copyFileSync(path, backup);
+if (!Array.isArray(pools['claude-custom'])) pools['claude-custom'] = [];
+const arr = pools['claude-custom'];
+let item = arr.find(x => String(x.customName || '').toLowerCase() === 'opusclaw' || x.CLAUDE_BASE_URL === 'https://api.opusclaw.me/v1');
+if (!item) { item = {}; arr.push(item); }
+item.uuid = item.uuid || crypto.randomUUID();
+item.customName = 'opusclaw';
+item.CLAUDE_BASE_URL = 'https://api.opusclaw.me/v1';
+item.CLAUDE_API_KEY = key;
+item.isDisabled = false;
+item.isHealthy = true;
+item.errorCount = 0;
+delete item.lastErrorMessage;
+delete item.needsRefresh;
+fs.writeFileSync(path, JSON.stringify(pools, null, 2) + '\n');
+console.log(JSON.stringify({backup, provider:'claude-custom', customName:item.customName, uuid:item.uuid, baseUrl:item.CLAUDE_BASE_URL, keyHash:crypto.createHash('sha256').update(key).digest('hex').slice(0,16), count:arr.length}, null, 2));

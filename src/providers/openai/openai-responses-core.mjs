@@ -18,7 +18,8 @@ class StreamState {
         status: 'in_progress',
         startTime: Math.floor(Date.now() / 1000),
         toolCalls: [],
-        currentToolCall: null
+        currentToolCall: null,
+        currentToolCalls: new Map()
       });
     }
     return this.states.get(requestId);
@@ -55,6 +56,33 @@ class StreamState {
 // 创建全局流式状态管理器
 const streamStateManager = new StreamState();
 
+function nextSequenceNumber(requestId) {
+  const state = streamStateManager.getOrCreateState(requestId);
+  state.sequenceNumber += 1;
+  return state.sequenceNumber;
+}
+
+function uniqueToolCalls(toolCalls) {
+  const seen = new Set();
+  const unique = [];
+  for (const toolCall of toolCalls || []) {
+    if (!toolCall || seen.has(toolCall.id)) continue;
+    seen.add(toolCall.id);
+    unique.push(toolCall);
+  }
+  return unique;
+}
+
+function resolveToolCall(state, itemId, outputIndex) {
+  if (itemId && state.currentToolCalls?.has(itemId)) {
+    return state.currentToolCalls.get(itemId);
+  }
+  if (state.currentToolCalls?.has(outputIndex)) {
+    return state.currentToolCalls.get(outputIndex);
+  }
+  return state.currentToolCall;
+}
+
 /**
  * Generates a response.created event
  */
@@ -66,6 +94,7 @@ function generateResponseCreated(requestId, model) {
 
   return {
     type: 'response.created',
+    sequence_number: nextSequenceNumber(requestId),
     response: {
       id: state.id,
       object: 'response',
@@ -103,6 +132,7 @@ function generateResponseInProgress(requestId) {
 
   return {
     type: 'response.in_progress',
+    sequence_number: nextSequenceNumber(requestId),
     response: {
       id: state.id,
       object: 'response',
@@ -141,6 +171,7 @@ function generateOutputItemAdded(requestId) {
 
   return {
     type: 'response.output_item.added',
+    sequence_number: nextSequenceNumber(requestId),
     output_index: 0,
     item: {
       id: state.msgId,
@@ -161,6 +192,7 @@ function generateContentPartAdded(requestId) {
 
   return {
     type: 'response.content_part.added',
+    sequence_number: nextSequenceNumber(requestId),
     item_id: state.msgId,
     output_index: 0,
     content_index: 0,
@@ -182,6 +214,7 @@ function generateOutputTextDelta(requestId, delta) {
 
   return {
     type: 'response.output_text.delta',
+    sequence_number: nextSequenceNumber(requestId),
     item_id: state.msgId,
     output_index: 0,
     content_index: 0,
@@ -199,6 +232,7 @@ function generateOutputTextDone(requestId) {
 
   return {
     type: 'response.output_text.done',
+    sequence_number: nextSequenceNumber(requestId),
     item_id: state.msgId,
     output_index: 0,
     content_index: 0,
@@ -215,6 +249,7 @@ function generateContentPartDone(requestId) {
 
   return {
     type: 'response.content_part.done',
+    sequence_number: nextSequenceNumber(requestId),
     item_id: state.msgId,
     output_index: 0,
     content_index: 0,
@@ -235,6 +270,7 @@ function generateOutputItemDone(requestId) {
 
   return {
     type: 'response.output_item.done',
+    sequence_number: nextSequenceNumber(requestId),
     output_index: 0,
     item: {
       id: state.msgId,
@@ -262,6 +298,7 @@ function generateResponseCompleted(requestId, usage) {
 
   return {
     type: 'response.completed',
+    sequence_number: nextSequenceNumber(requestId),
     response: {
       background: false,
       created_at: state.startTime,
@@ -304,7 +341,7 @@ function generateResponseCompleted(requestId, usage) {
       },
       safety_identifier: `user-${uuidv4().replace(/-/g, '')}`, // 随机值
       service_tier: "default",
-      status: (state.toolCalls && state.toolCalls.length > 0) ? "requires_action" : "completed",
+      status: "completed",
       store: false,
       temperature: 1,
       text: {
@@ -332,44 +369,95 @@ function generateResponseCompleted(requestId, usage) {
 }
 
 
-function startToolCall(requestId, toolCallId, name) {
+function startToolCall(requestId, toolCallId, name, outputIndex = 0) {
   const state = streamStateManager.getOrCreateState(requestId);
-  state.currentToolCall = { id: toolCallId, call_id: toolCallId, name: name, arguments: '' };
+  const id = toolCallId || `call_${uuidv4().replace(/-/g, '')}`;
+  const toolCall = { id, call_id: id, name: name, arguments: '', outputIndex };
+  state.currentToolCall = toolCall;
+  state.currentToolCalls.set(outputIndex, toolCall);
+  state.currentToolCalls.set(id, toolCall);
+  return toolCall;
 }
 
-function appendToolCallArgs(requestId, delta) {
+function appendToolCallArgs(requestId, delta, itemId = null, outputIndex = 0) {
   const state = streamStateManager.getOrCreateState(requestId);
-  if (state.currentToolCall) state.currentToolCall.arguments += delta;
+  const toolCall = resolveToolCall(state, itemId, outputIndex);
+  if (toolCall) toolCall.arguments += delta;
+  return toolCall;
 }
 
-function finishToolCall(requestId) {
+function finishToolCall(requestId, itemId = null, outputIndex = 0) {
   const state = streamStateManager.getOrCreateState(requestId);
-  if (state.currentToolCall) {
-    state.toolCalls.push({...state.currentToolCall});
-    const finished = state.currentToolCall;
-    state.currentToolCall = null;
+  const toolCall = resolveToolCall(state, itemId, outputIndex);
+  if (toolCall) {
+    if (!state.toolCalls.some(existing => existing.id === toolCall.id)) {
+      state.toolCalls.push({...toolCall});
+    }
+    const finished = {...toolCall};
+    state.currentToolCalls.delete(toolCall.id);
+    state.currentToolCalls.delete(toolCall.outputIndex);
+    if (state.currentToolCall?.id === toolCall.id) {
+      state.currentToolCall = null;
+    }
     return finished;
   }
   return null;
 }
 
 function generateFunctionCallArgsDelta(requestId, itemId, outputIndex, delta) {
-  appendToolCallArgs(requestId, delta);
-  return { type: 'response.function_call_arguments.delta', item_id: itemId, output_index: outputIndex, delta: delta };
+  const toolCall = appendToolCallArgs(requestId, delta, itemId, outputIndex);
+  return {
+    type: 'response.function_call_arguments.delta',
+    sequence_number: nextSequenceNumber(requestId),
+    item_id: toolCall?.id || itemId,
+    output_index: outputIndex,
+    delta: delta
+  };
 }
 
 function generateFunctionCallArgsDone(requestId, itemId, outputIndex) {
   const state = streamStateManager.getOrCreateState(requestId);
-  const args = state.currentToolCall ? state.currentToolCall.arguments : '{}';
-  return { type: 'response.function_call_arguments.done', item_id: itemId, output_index: outputIndex, arguments: args };
+  const toolCall = resolveToolCall(state, itemId, outputIndex);
+  const args = toolCall ? toolCall.arguments : '{}';
+  return {
+    type: 'response.function_call_arguments.done',
+    sequence_number: nextSequenceNumber(requestId),
+    item_id: toolCall?.id || itemId,
+    output_index: outputIndex,
+    name: toolCall?.name || '',
+    arguments: args
+  };
+}
+
+function generateFunctionCallOutputItemAdded(requestId, toolCall, outputIndex) {
+  return {
+    type: 'response.output_item.added',
+    sequence_number: nextSequenceNumber(requestId),
+    output_index: outputIndex,
+    item: {
+      id: toolCall.id,
+      call_id: toolCall.call_id || toolCall.id,
+      type: 'function_call',
+      name: toolCall.name,
+      arguments: '',
+      status: 'in_progress'
+    }
+  };
 }
 
 function generateFunctionCallOutputItemDone(requestId, toolCall, outputIndex) {
   return {
-    type: 'response.output_item.done', output_index: outputIndex,
+    type: 'response.output_item.done',
+    sequence_number: nextSequenceNumber(requestId),
+    output_index: outputIndex,
     item: { id: toolCall.id, call_id: toolCall.call_id || toolCall.id, type: 'function_call',
       name: toolCall.name, arguments: toolCall.arguments || '{}', status: 'completed' }
   };
+}
+
+function getPendingToolCalls(requestId) {
+  const state = streamStateManager.getOrCreateState(requestId);
+  return uniqueToolCalls(Array.from(state.currentToolCalls?.values() || []));
 }
 
 // 导出流式状态管理器以供外部使用
@@ -377,4 +465,5 @@ export { streamStateManager, generateResponseCreated, generateResponseInProgress
   generateOutputItemAdded, generateContentPartAdded, generateOutputTextDelta,
   generateOutputTextDone, generateContentPartDone, generateOutputItemDone,
   generateResponseCompleted, startToolCall, appendToolCallArgs, finishToolCall,
-  generateFunctionCallArgsDelta, generateFunctionCallArgsDone, generateFunctionCallOutputItemDone };
+  generateFunctionCallArgsDelta, generateFunctionCallArgsDone, generateFunctionCallOutputItemAdded,
+  generateFunctionCallOutputItemDone, getPendingToolCalls, nextSequenceNumber };
