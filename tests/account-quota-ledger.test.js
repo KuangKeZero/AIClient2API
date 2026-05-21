@@ -101,33 +101,120 @@ describe('AccountQuotaLedger routing decisions', () => {
         });
     });
 
-    test('asks for reset confirmation when resetAt is reached before routing the account again', () => {
+    test('ignores custom relay providers for quota routing and restore lists', () => {
         const ledger = new AccountQuotaLedger({ enabled: true, autoLoad: false });
+
+        expect(ledger.applyRealUsage('openaiResponses-custom-plus', 'relay-1', {
+            summary: { usedPercent: 100, plan: 'PLUS', resetAt: '2030-01-01T00:00:00.000Z' }
+        })).toBeNull();
+        expect(ledger.recordEstimatedUsage('claude-custom', 'relay-2', {
+            model: 'claude-opus-4-5',
+            usage: { totalTokens: 5000000 }
+        })).toBeNull();
+
+        ledger.store.accounts['openaiResponses-custom-plus:relay-1'] = {
+            providerType: 'openaiResponses-custom-plus',
+            uuid: 'relay-1',
+            customName: 'codex-subgo-plus',
+            lastRealUsagePercent: 100,
+            estimatedUsagePercent: 100,
+            resetAt: '2030-01-01T00:00:00.000Z',
+            disabledUntil: '2030-01-01T00:00:00.000Z',
+            confidence: 1,
+            recent429: [],
+            recent401: [],
+            refresh: {
+                pending: false,
+                needsResetConfirm: true,
+                nextVerifyAt: null
+            },
+            deletedAt: null
+        };
+
+        expect(ledger.getRoutingDecision('openaiResponses-custom-plus', { uuid: 'relay-1' })).toMatchObject({
+            skip: false,
+            reason: null
+        });
+        expect(ledger.getPendingRestoreAccounts('openaiResponses-custom-plus')).toHaveLength(0);
+        expect(ledger.getPendingRestoreAccounts()).toHaveLength(0);
+    });
+
+    test('auto-recovers overdue reset windows after sleep without a real usage refresh', () => {
+        const ledger = new AccountQuotaLedger({ enabled: true, autoLoad: false });
+        const start = 1700000000000;
+        const resetAt = start + (5 * 60 * 60 * 1000);
+        const wakeAt = resetAt + 1;
 
         ledger.ensureAccount('openai-codex-oauth', { uuid: 'resetting' });
         ledger.applyRealUsage('openai-codex-oauth', 'resetting', {
             summary: {
                 usedPercent: 100,
                 plan: 'PLUS',
-                resetAt: '2023-11-14T22:13:20.000Z'
+                resetAt: new Date(resetAt).toISOString()
             }
-        });
-        ledger.record429('openai-codex-oauth', 'resetting', {
-            quotaLike: true,
-            resetAt: '2023-11-14T22:13:20.000Z',
-            now: 1700000000000
-        });
+        }, start);
 
         const decision = ledger.getRoutingDecision(
             'openai-codex-oauth',
             { uuid: 'resetting' },
-            1700000000001
+            wakeAt
         );
 
         expect(decision).toMatchObject({
-            skip: true,
-            reason: 'awaiting_reset_refresh',
-            refreshReason: 'reset_reached'
+            skip: false,
+            reason: null
+        });
+        expect(ledger.getAccount('openai-codex-oauth', 'resetting')).toMatchObject({
+            estimatedUsagePercent: 0,
+            disabledUntil: null,
+            refresh: {
+                pending: false,
+                needsFirstRefresh: false,
+                needsResetConfirm: false
+            }
+        });
+        expect(ledger.getPendingRestoreAccounts('openai-codex-oauth', wakeAt)).toHaveLength(0);
+    });
+
+    test('auto-recovers stale local estimates when a known resetAt elapsed without reset confirmation', () => {
+        const ledger = new AccountQuotaLedger({ enabled: true, autoLoad: false });
+        const start = 1700000000000;
+        const resetAt = start + (5 * 60 * 60 * 1000);
+        const wakeAt = resetAt + 1;
+
+        ledger.applyRealUsage('openai-codex-oauth-plus', 'plus-window', {
+            summary: {
+                usedPercent: 28,
+                plan: 'PLUS',
+                resetAt: new Date(resetAt).toISOString()
+            }
+        }, start);
+        ledger.recordEstimatedUsage('openai-codex-oauth-plus', 'plus-window', {
+            model: 'gpt-5-codex',
+            usage: { totalTokens: 500000 }
+        }, start + 1000);
+
+        const decision = ledger.getRoutingDecision(
+            'openai-codex-oauth-plus',
+            { uuid: 'plus-window' },
+            wakeAt
+        );
+
+        expect(decision).toMatchObject({
+            skip: false,
+            reason: null
+        });
+        expect(ledger.getAccount('openai-codex-oauth-plus', 'plus-window')).toMatchObject({
+            lastRealUsagePercent: null,
+            estimatedUsagePercent: 0,
+            resetAt: null,
+            disabledUntil: null,
+            refresh: {
+                pending: false,
+                needsFirstRefresh: false,
+                needsResetConfirm: false,
+                lastReason: 'reset_window_elapsed'
+            }
         });
     });
 });
@@ -164,13 +251,11 @@ describe('AccountQuotaLedger request accounting', () => {
         });
     });
 
-    test('counts three recent 401s as a deletion signal and resets after success', () => {
-        const ledger = new AccountQuotaLedger({ enabled: true, autoLoad: false });
+    test('treats the first 401 as a deletion signal and resets after success', () => {
+        const ledger = new AccountQuotaLedger({ enabled: true, autoLoad: false, authDeleteCount: 3 });
         ledger.ensureAccount('openai-codex-oauth', { uuid: 'bad-auth' });
 
-        expect(ledger.record401('openai-codex-oauth', 'bad-auth', { now: 1000 }).shouldDelete).toBe(false);
-        expect(ledger.record401('openai-codex-oauth', 'bad-auth', { now: 2000 }).shouldDelete).toBe(false);
-        expect(ledger.record401('openai-codex-oauth', 'bad-auth', { now: 3000 }).shouldDelete).toBe(true);
+        expect(ledger.record401('openai-codex-oauth', 'bad-auth', { now: 1000 }).shouldDelete).toBe(true);
 
         ledger.recordEstimatedUsage('openai-codex-oauth', 'bad-auth', {
             model: 'gpt-5-codex',
@@ -214,6 +299,37 @@ describe('AccountQuotaLedger request accounting', () => {
 
         expect(ledger.estimateUsagePercent(account, 'gpt-5-codex', { totalTokens: 300000 })).toBeCloseTo(2);
         expect(ledger.estimateUsagePercent(account, 'gpt-5.4-mini', { totalTokens: 300000 })).toBeCloseTo(1.6);
+    });
+
+    test('keeps the first post-reset estimate after sleep compensation', () => {
+        const ledger = new AccountQuotaLedger({ enabled: true, autoLoad: false });
+        const start = 1700000000000;
+        const resetAt = start + (5 * 60 * 60 * 1000);
+        const wakeAt = resetAt + 1;
+
+        ledger.applyRealUsage('openai-codex-oauth', 'post-reset', {
+            summary: {
+                usedPercent: 100,
+                plan: 'PLUS',
+                resetAt: new Date(resetAt).toISOString()
+            }
+        }, start);
+
+        const result = ledger.recordEstimatedUsage('openai-codex-oauth', 'post-reset', {
+            model: 'gpt-5-codex',
+            usage: { totalTokens: 250000 }
+        }, wakeAt);
+
+        expect(result.increment).toBeCloseTo(1);
+        expect(ledger.getAccount('openai-codex-oauth', 'post-reset')).toMatchObject({
+            estimatedUsagePercent: result.increment,
+            disabledUntil: null,
+            refresh: {
+                pending: false,
+                needsFirstRefresh: false,
+                needsResetConfirm: false
+            }
+        });
     });
 });
 
@@ -277,6 +393,48 @@ describe('ProviderPoolManager account quota integration', () => {
         expect(selected.uuid).toBe('available');
     });
 
+    test('leaves relay providers out of local quota ledger routing', () => {
+        const manager = createPoolManager({
+            'openaiResponses-custom-plus': [
+                { uuid: 'relay', customName: 'codex-subgo-plus', isHealthy: true, isDisabled: false }
+            ]
+        });
+        manager.accountQuotaLedger.store.accounts['openaiResponses-custom-plus:relay'] = {
+            providerType: 'openaiResponses-custom-plus',
+            uuid: 'relay',
+            customName: 'codex-subgo-plus',
+            lastRealUsagePercent: 100,
+            estimatedUsagePercent: 100,
+            resetAt: '2030-01-01T00:00:00.000Z',
+            disabledUntil: '2030-01-01T00:00:00.000Z',
+            confidence: 1,
+            recent429: [],
+            recent401: [],
+            refresh: {
+                pending: false,
+                needsResetConfirm: true,
+                nextVerifyAt: null
+            },
+            deletedAt: null
+        };
+
+        const selected = manager._doSelectProvider('openaiResponses-custom-plus', null, { skipUsageCount: true });
+        const success = manager.recordAccountRequestSuccess('openaiResponses-custom-plus', 'relay', {
+            model: 'gpt-5.5',
+            usage: { totalTokens: 5000000 }
+        });
+        const failure = manager.recordAccountRequestFailure(
+            'openaiResponses-custom-plus',
+            'relay',
+            Object.assign(new Error('rate limited'), { status: 429 }),
+            { model: 'gpt-5.5' }
+        );
+
+        expect(selected.uuid).toBe('relay');
+        expect(success).toBeNull();
+        expect(failure).toMatchObject({ handled: false, status: 429 });
+    });
+
     test('routes around accounts whose concurrency is already full', () => {
         const manager = createPoolManager({
             'openai-codex-oauth': [
@@ -298,7 +456,7 @@ describe('ProviderPoolManager account quota integration', () => {
         expect(selected.uuid).toBe('idle');
     });
 
-    test('removes an account from the pool after three recent auth failures', () => {
+    test('removes an account from the pool after one auth failure', () => {
         const manager = createPoolManager({
             'openai-codex-oauth': [
                 { uuid: 'bad-auth', isHealthy: true, isDisabled: false }
@@ -306,8 +464,6 @@ describe('ProviderPoolManager account quota integration', () => {
         });
 
         const authError = Object.assign(new Error('Unauthorized'), { status: 401 });
-        manager.recordAccountRequestFailure('openai-codex-oauth', 'bad-auth', authError);
-        manager.recordAccountRequestFailure('openai-codex-oauth', 'bad-auth', authError);
         const result = manager.recordAccountRequestFailure('openai-codex-oauth', 'bad-auth', authError);
 
         expect(result.deleted).toBe(true);
@@ -343,7 +499,7 @@ describe('ProviderPoolManager account quota integration', () => {
         });
     });
 
-    test('counts auth failures from refresh paths toward account deletion', () => {
+    test('removes accounts after one auth failure from refresh paths', () => {
         const manager = createPoolManager({
             'openai-codex-oauth': [
                 { uuid: 'bad-refresh', isHealthy: true, isDisabled: false }
@@ -351,8 +507,6 @@ describe('ProviderPoolManager account quota integration', () => {
         });
 
         const refreshError = new Error('Failed to refresh Codex token. Please re-authenticate.');
-        manager._recordAccountAuthFailure('openai-codex-oauth', 'bad-refresh', refreshError, 'token_refresh');
-        manager._recordAccountAuthFailure('openai-codex-oauth', 'bad-refresh', refreshError, 'token_refresh');
         const result = manager._recordAccountAuthFailure('openai-codex-oauth', 'bad-refresh', refreshError, 'token_refresh');
 
         expect(result.shouldDelete).toBe(true);
@@ -536,6 +690,167 @@ describe('Usage API local ledger overlay', () => {
             lastRealUsagePercent: 64,
             thresholdPercent: 70
         });
+    });
+
+    test('auto-recovers overdue reset windows in provider usage overlays after sleep', () => {
+        const ledger = new AccountQuotaLedger({ enabled: true, autoLoad: false });
+        const start = 1700000000000;
+        const resetAt = new Date(start + (5 * 60 * 60 * 1000)).toISOString();
+        const wakeAt = start + (5 * 60 * 60 * 1000) + 1;
+
+        ledger.applyRealUsage('openai-codex-oauth', 'sleeping-1', {
+            summary: {
+                usedPercent: 100,
+                plan: 'PLUS',
+                resetAt
+            }
+        }, start);
+
+        const providerUsage = {
+            instances: [
+                {
+                    uuid: 'sleeping-1',
+                    name: 'sleeping-1',
+                    isHealthy: true,
+                    isDisabled: false,
+                    success: true,
+                    usage: {
+                        summary: {
+                            usedPercent: 100,
+                            status: 'danger',
+                            plan: 'PLUS',
+                            planClass: 'plan-plus',
+                            resetAt
+                        },
+                        items: []
+                    },
+                    error: null
+                }
+            ],
+            totalCount: 1,
+            successCount: 1,
+            errorCount: 0
+        };
+
+        const dateNowSpy = jest.spyOn(Date, 'now').mockReturnValue(wakeAt);
+        try {
+            applyAccountQuotaLedgerToProviderUsage(
+                'openai-codex-oauth',
+                providerUsage,
+                {
+                    providerPools: {
+                        'openai-codex-oauth': [
+                            { uuid: 'sleeping-1', plan: 'PLUS' }
+                        ]
+                    }
+                },
+                {
+                    providerPools: {
+                        'openai-codex-oauth': [
+                            { uuid: 'sleeping-1', plan: 'PLUS' }
+                        ]
+                    },
+                    accountQuotaLedger: ledger
+                }
+            );
+        } finally {
+            dateNowSpy.mockRestore();
+        }
+
+        expect(providerUsage.instances).toHaveLength(1);
+        expect(providerUsage.instances[0].usage.summary).toMatchObject({
+            usedPercent: 0,
+            localUsedPercent: 0,
+            status: 'normal',
+            resetAt: null,
+            routingSkipped: false
+        });
+        expect(providerUsage.pendingRestoreAccounts).toHaveLength(0);
+        expect(ledger.getAccount('openai-codex-oauth', 'sleeping-1')).toMatchObject({
+            estimatedUsagePercent: 0,
+            disabledUntil: null,
+            refresh: {
+                pending: false,
+                needsFirstRefresh: false,
+                needsResetConfirm: false
+            }
+        });
+    });
+
+    test('auto-recovers stale local estimates in provider usage overlays after resetAt elapsed', () => {
+        const ledger = new AccountQuotaLedger({ enabled: true, autoLoad: false });
+        const start = 1700000000000;
+        const resetAt = new Date(start + (5 * 60 * 60 * 1000)).toISOString();
+        const wakeAt = start + (5 * 60 * 60 * 1000) + 1;
+
+        ledger.applyRealUsage('openai-codex-oauth-plus', 'plus-window-ui', {
+            summary: {
+                usedPercent: 28,
+                plan: 'PLUS',
+                resetAt
+            }
+        }, start);
+        ledger.recordEstimatedUsage('openai-codex-oauth-plus', 'plus-window-ui', {
+            model: 'gpt-5-codex',
+            usage: { totalTokens: 500000 }
+        }, start + 1000);
+
+        const providerUsage = {
+            instances: [
+                {
+                    uuid: 'plus-window-ui',
+                    name: 'plus-window-ui',
+                    isHealthy: true,
+                    isDisabled: false,
+                    success: true,
+                    usage: {
+                        summary: {
+                            usedPercent: 30,
+                            status: 'normal',
+                            plan: 'PLUS',
+                            planClass: 'plan-plus',
+                            resetAt
+                        },
+                        items: []
+                    },
+                    error: null
+                }
+            ],
+            totalCount: 1,
+            successCount: 1,
+            errorCount: 0
+        };
+
+        applyAccountQuotaLedgerToProviderUsage(
+            'openai-codex-oauth-plus',
+            providerUsage,
+            {
+                providerPools: {
+                    'openai-codex-oauth-plus': [
+                        { uuid: 'plus-window-ui', plan: 'PLUS' }
+                    ]
+                }
+            },
+            {
+                providerPools: {
+                    'openai-codex-oauth-plus': [
+                        { uuid: 'plus-window-ui', plan: 'PLUS' }
+                    ]
+                },
+                accountQuotaLedger: ledger
+            },
+            wakeAt
+        );
+
+        expect(providerUsage.instances).toHaveLength(1);
+        expect(providerUsage.instances[0].usage.summary).toMatchObject({
+            usedPercent: 0,
+            localUsedPercent: 0,
+            status: 'normal',
+            resetAt: null,
+            routingSkipped: false
+        });
+        expect(providerUsage.pendingRestoreAccounts).toHaveLength(0);
     });
 
     test('hides deleted ledger accounts from the visible usage list', () => {

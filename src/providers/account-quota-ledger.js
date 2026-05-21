@@ -4,6 +4,14 @@ import logger from '../utils/logger.js';
 import { atomicWriteFile, withFileLock } from '../utils/file-lock.js';
 
 const LEDGER_VERSION = 1;
+const DEFAULT_MANAGED_PROVIDER_PREFIXES = [
+    'claude-kiro-oauth',
+    'gemini-cli-oauth',
+    'gemini-antigravity',
+    'openai-codex-oauth',
+    'grok-web'
+];
+
 const DEFAULT_OPTIONS = {
     enabled: true,
     autoLoad: true,
@@ -38,11 +46,21 @@ const DEFAULT_OPTIONS = {
     maxRetryAfterMs: 60 * 60 * 1000,
     recentWindowMs: 30 * 60 * 1000,
     maxRecentEvents: 10,
-    authDeleteCount: 3,
+    authDeleteCount: 1,
     refreshThrottleMs: 5 * 60 * 1000,
     poolLowAvailableCount: 1,
-    poolLowAvailableRatio: 0.2
+    poolLowAvailableRatio: 0.2,
+    managedProviderPrefixes: DEFAULT_MANAGED_PROVIDER_PREFIXES
 };
+
+function normalizeStringList(value, fallback = []) {
+    if (value === undefined || value === null) return [...fallback];
+    if (!Array.isArray(value)) return [...fallback];
+
+    return value
+        .map(item => String(item || '').trim())
+        .filter(Boolean);
+}
 
 function normalizeOptions(options = {}) {
     const configured = options.ACCOUNT_QUOTA_LEDGER && typeof options.ACCOUNT_QUOTA_LEDGER === 'object'
@@ -60,6 +78,10 @@ function normalizeOptions(options = {}) {
             ...DEFAULT_OPTIONS.modelCostMultipliers,
             ...(configured.modelCostMultipliers || {})
         },
+        managedProviderPrefixes: normalizeStringList(
+            configured.managedProviderPrefixes,
+            DEFAULT_OPTIONS.managedProviderPrefixes
+        ),
         autoLoad: options.autoLoad ?? configured.autoLoad ?? DEFAULT_OPTIONS.autoLoad,
         saveStore: options.saveStore || configured.saveStore
     };
@@ -319,6 +341,15 @@ export class AccountQuotaLedger {
         return this.options.enabled !== false;
     }
 
+    supportsProvider(providerType) {
+        if (!this.enabled || !providerType) return false;
+
+        const prefixes = normalizeStringList(this.options.managedProviderPrefixes, DEFAULT_MANAGED_PROVIDER_PREFIXES);
+        if (prefixes.length === 0) return false;
+
+        return prefixes.some(prefix => providerType === prefix || providerType.startsWith(`${prefix}-`));
+    }
+
     load() {
         if (!this.enabled) return;
         const filePath = this.options.filePath;
@@ -377,7 +408,7 @@ export class AccountQuotaLedger {
     }
 
     ensureAccount(providerType, providerConfig = {}, now = Date.now()) {
-        if (!this.enabled || !providerType || !providerConfig?.uuid) return null;
+        if (!this.supportsProvider(providerType) || !providerConfig?.uuid) return null;
 
         const key = accountKey(providerType, providerConfig.uuid);
         const existing = this.store.accounts[key];
@@ -430,11 +461,12 @@ export class AccountQuotaLedger {
     }
 
     getAccount(providerType, uuid) {
-        if (!providerType || !uuid) return null;
+        if (!this.supportsProvider(providerType) || !uuid) return null;
         return this.store.accounts[accountKey(providerType, uuid)] || null;
     }
 
     getAccountsForProvider(providerType) {
+        if (!this.supportsProvider(providerType)) return [];
         return Object.values(this.store.accounts).filter(account => account.providerType === providerType && !account.deletedAt);
     }
 
@@ -483,6 +515,7 @@ export class AccountQuotaLedger {
 
     getPendingRestoreAccounts(providerType = null, now = Date.now()) {
         const pendingAccounts = Object.values(this.store.accounts || {})
+            .filter(account => this.supportsProvider(account.providerType))
             .filter(account => !providerType || account.providerType === providerType)
             .map(account => {
                 const reason = this._getPendingRestoreReason(account, now);
@@ -537,6 +570,37 @@ export class AccountQuotaLedger {
         if (bucket === 'free') return this.options.freeThresholdPercent;
         if (bucket === 'plus') return this.options.plusThresholdPercent;
         return this.options.defaultThresholdPercent;
+    }
+
+    _recoverExpiredResetWindow(account, now = Date.now()) {
+        if (!account || account.deletedAt) return false;
+
+        const resetAtMs = parseTimeMs(account.resetAt);
+        const disabledUntilMs = parseTimeMs(account.disabledUntil);
+        const resetReached = resetAtMs && resetAtMs <= now;
+        const disabledReached = disabledUntilMs && disabledUntilMs <= now;
+
+        const refresh = account.refresh || {};
+        if (!resetReached && !(refresh.needsResetConfirm && disabledReached)) return false;
+
+        account.lastRealUsagePercent = null;
+        account.estimatedUsagePercent = 0;
+        account.resetAt = null;
+        account.disabledUntil = null;
+        account.confidence = this.options.estimateConfidenceFloor;
+        account.recent429 = [];
+        account.refresh = {
+            ...refresh,
+            pending: false,
+            needsFirstRefresh: false,
+            needsResetConfirm: false,
+            requestedReasons: [],
+            lastReason: 'reset_window_elapsed',
+            nextVerifyAt: null
+        };
+        account.updatedAt = nowIso(now);
+        this._scheduleSave();
+        return true;
     }
 
     applyRealUsage(providerType, uuid, formattedUsage, now = Date.now()) {
@@ -633,6 +697,7 @@ export class AccountQuotaLedger {
     recordEstimatedUsage(providerType, uuid, details = {}, now = Date.now()) {
         const account = this.ensureAccount(providerType, { uuid }, now);
         if (!account) return null;
+        this._recoverExpiredResetWindow(account, now);
 
         const usage = details.usage?.totalTokens !== undefined
             ? details.usage
@@ -737,11 +802,12 @@ export class AccountQuotaLedger {
     record401(providerType, uuid, details = {}, now = details.now || Date.now()) {
         const account = this.ensureAccount(providerType, { uuid }, now);
         if (!account) return { shouldDelete: false, account: null };
+        const status = Number(details.status || 401);
 
         account.recent401 = this._pruneRecent(account.recent401, now);
         account.recent401.push({
             at: nowIso(now),
-            status: 401,
+            status,
             message: details.message || null
         });
         account.recent401 = account.recent401.slice(-this.options.maxRecentEvents);
@@ -750,7 +816,7 @@ export class AccountQuotaLedger {
 
         return {
             account,
-            shouldDelete: account.recent401.length >= this.options.authDeleteCount
+            shouldDelete: status === 401 || account.recent401.length >= this.options.authDeleteCount
         };
     }
 
@@ -820,7 +886,7 @@ export class AccountQuotaLedger {
     }
 
     getRoutingDecision(providerType, providerConfig = {}, now = Date.now()) {
-        if (!this.enabled) {
+        if (!this.supportsProvider(providerType)) {
             return { skip: false, reason: null };
         }
 
@@ -832,6 +898,8 @@ export class AccountQuotaLedger {
         if (account.deletedAt) {
             return { skip: true, reason: 'deleted', account };
         }
+
+        this._recoverExpiredResetWindow(account, now);
 
         const nextVerifyMs = parseTimeMs(account.refresh?.nextVerifyAt);
         if (account.refresh?.needsResetConfirm && nextVerifyMs && nextVerifyMs <= now) {

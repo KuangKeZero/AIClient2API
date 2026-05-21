@@ -644,8 +644,15 @@ export class ProviderPoolManager {
         return (providerStatus?.state?.activeCount || 0) >= concurrencyLimit;
     }
 
+    _usesAccountQuotaLedger(providerType) {
+        return !!(
+            this.accountQuotaLedger?.enabled &&
+            (typeof this.accountQuotaLedger.supportsProvider !== 'function' || this.accountQuotaLedger.supportsProvider(providerType))
+        );
+    }
+
     _filterByQuotaLedger(providerType, providers, now = Date.now()) {
-        if (!this.accountQuotaLedger?.enabled) {
+        if (!this._usesAccountQuotaLedger(providerType)) {
             return providers.filter(provider => !this._isConcurrencyFull(provider));
         }
 
@@ -709,13 +716,22 @@ export class ProviderPoolManager {
         if (status !== 401 && status !== 403) {
             return { handled: false, status };
         }
+        if (!this._usesAccountQuotaLedger(providerType)) {
+            return { handled: false, status };
+        }
 
         const result = this.accountQuotaLedger.record401(providerType, uuid, {
+            status,
             message: `${source}: ${error?.message || 'authentication failed'}`
         });
 
         if (result.shouldDelete) {
-            this.removeProvider(providerType, uuid, `three recent ${status} responses`);
+            const count = result.account?.recent401?.length || 1;
+            const responseLabel = count === 1 ? 'response' : 'responses';
+            const reason = status === 401
+                ? `current ${status} response`
+                : `${count} recent ${status} ${responseLabel}`;
+            this.removeProvider(providerType, uuid, reason);
         }
 
         return {
@@ -727,7 +743,7 @@ export class ProviderPoolManager {
     }
 
     _syncProviderWithAccountQuota(providerType, providerConfig, account, reason = 'quota') {
-        if (!this.accountQuotaLedger?.enabled || !providerConfig?.uuid || !account || providerConfig.isDisabled) {
+        if (!this._usesAccountQuotaLedger(providerType) || !providerConfig?.uuid || !account || providerConfig.isDisabled) {
             return false;
         }
 
@@ -755,6 +771,7 @@ export class ProviderPoolManager {
 
         const types = providerType ? [providerType] : Object.keys(this.providerStatus || {});
         for (const type of types) {
+            if (!this._usesAccountQuotaLedger(type)) continue;
             for (const provider of this.providerStatus[type] || []) {
                 const decision = this.accountQuotaLedger.getRoutingDecision(type, provider.config);
                 if (decision.skip) {
@@ -765,7 +782,7 @@ export class ProviderPoolManager {
     }
 
     _scheduleAccountUsageRefresh(providerType, providerConfig, reason, options = {}) {
-        if (!this.accountQuotaLedger?.enabled || !providerConfig?.uuid) return;
+        if (!this._usesAccountQuotaLedger(providerType) || !providerConfig?.uuid) return;
         if (providerConfig.isDisabled && !options.force) return;
 
         const queued = this.accountQuotaLedger.requestRefresh(providerType, providerConfig.uuid, reason, Date.now(), options);
@@ -780,7 +797,7 @@ export class ProviderPoolManager {
     }
 
     async _refreshAccountUsage(providerType, uuid, reason = 'manual') {
-        if (!this.accountQuotaLedger?.enabled || !uuid) return null;
+        if (!this._usesAccountQuotaLedger(providerType) || !uuid) return null;
         const provider = this._findProvider(providerType, uuid);
         if (!provider) {
             this.accountQuotaLedger.markRefreshFailed(providerType, uuid, reason, 'provider not found');
@@ -831,6 +848,7 @@ export class ProviderPoolManager {
     refreshInitialAccountQuotaLedgers() {
         if (!this.accountQuotaLedger?.enabled) return;
         for (const providerType of Object.keys(this.providerStatus || {})) {
+            if (!this._usesAccountQuotaLedger(providerType)) continue;
             for (const provider of this.providerStatus[providerType] || []) {
                 const decision = this.accountQuotaLedger.getRoutingDecision(providerType, provider.config);
                 if (decision.refreshReason === 'first_seen') {
@@ -841,7 +859,7 @@ export class ProviderPoolManager {
     }
 
     recordAccountRequestSuccess(providerType, uuid, details = {}) {
-        if (!this.accountQuotaLedger?.enabled || !providerType || !uuid) return null;
+        if (!this._usesAccountQuotaLedger(providerType) || !providerType || !uuid) return null;
         const usage = details.usage?.totalTokens !== undefined
             ? details.usage
             : extractTokenUsage(details.usage, details.nativeResponse, details.clientResponse);
@@ -866,11 +884,15 @@ export class ProviderPoolManager {
     }
 
     recordAccountRequestFailure(providerType, uuid, error, details = {}) {
-        if (!this.accountQuotaLedger?.enabled || !providerType || !uuid || !error) {
+        if (!providerType || !uuid || !error) {
             return { handled: false };
         }
 
         const status = this._getErrorStatus(error);
+        if (!this._usesAccountQuotaLedger(providerType)) {
+            return { handled: false, status };
+        }
+
         if (status === 401 || status === 403) {
             const result = this._recordAccountAuthFailure(providerType, uuid, error, 'request');
             return {

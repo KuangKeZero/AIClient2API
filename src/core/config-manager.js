@@ -99,7 +99,7 @@ export async function initializeConfig(args = process.argv.slice(2), configFileP
             shortCooldownMs: 30000,
             longCooldownMs: 21600000,
             lowFrequencyVerificationMs: 3600000,
-            authDeleteCount: 3,
+            authDeleteCount: 1,
             poolLowAvailableCount: 1,
             poolLowAvailableRatio: 0.2,
             tokensPerPercent: {
