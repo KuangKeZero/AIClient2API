@@ -10,6 +10,7 @@ import {
 } from '../providers/provider-models.js';
 import { generateUUID, createProviderConfig, formatSystemPath, detectProviderFromPath, addToUsedPaths, isPathUsed, pathsEqual } from '../utils/provider-utils.js';
 import { broadcastEvent } from './event-broadcast.js';
+import { cleanupCredentialFilesForDeletedProviders } from './credential-cleanup.js';
 import { getRegisteredProviders, getServiceAdapter, invalidateServiceAdapter, serviceInstances } from '../providers/adapter.js';
 import { withFileLock, atomicWriteFile } from '../utils/file-lock.js';
 import { normalizeProviderConfigFields } from '../utils/provider-config-normalizer.js';
@@ -715,12 +716,34 @@ async function _handleDeleteProvider(req, res, currentConfig, providerPoolManage
             providerPoolManager.initializeProviderStatus();
         }
 
+        let credentialCleanup;
+        try {
+            credentialCleanup = await cleanupCredentialFilesForDeletedProviders(
+                [deletedProvider],
+                currentConfig,
+                providerPools
+            );
+        } catch (cleanupError) {
+            const failedCredentialPath = Object.entries(deletedProvider || {})
+                .find(([key, value]) => /_(?:CREDS|TOKEN)_FILE_PATH$/.test(key) && typeof value === 'string' && value.trim())?.[1]?.trim()
+                || providerUuid
+                || 'credential_cleanup';
+
+            logger.warn(`[UI API] Credential cleanup failed after deleting provider ${providerUuid} from ${providerType}: ${cleanupError.message}`);
+            credentialCleanup = {
+                deletedFiles: [],
+                skippedFiles: [],
+                failedFiles: [{ path: failedCredentialPath, error: cleanupError.message }]
+            };
+        }
+
         // 广播更新事件
         broadcastEvent('config_update', {
             action: 'delete',
             filePath: filePath,
             providerType,
             providerConfig: sanitizeProviderData(deletedProvider),
+            credentialCleanup,
             timestamp: new Date().toISOString()
         });
 
@@ -728,7 +751,8 @@ async function _handleDeleteProvider(req, res, currentConfig, providerPoolManage
         res.end(JSON.stringify({
             success: true,
             message: 'Provider deleted successfully',
-            deletedProvider: sanitizeProviderData(deletedProvider)
+            deletedProvider: sanitizeProviderData(deletedProvider),
+            credentialCleanup
         }));
         return true;
     } catch (error) {
@@ -1003,6 +1027,29 @@ async function _handleDeleteUnhealthyProviders(req, res, currentConfig, provider
             providerPoolManager.initializeProviderStatus();
         }
 
+        let credentialCleanup;
+        try {
+            credentialCleanup = await cleanupCredentialFilesForDeletedProviders(
+                unhealthyProviders,
+                currentConfig,
+                providerPools
+            );
+        } catch (cleanupError) {
+            const failedFiles = unhealthyProviders
+                .flatMap(provider => Object.entries(provider || {})
+                    .filter(([key, value]) => /_(?:CREDS|TOKEN)_FILE_PATH$/.test(key) && typeof value === 'string' && value.trim())
+                    .map(([, value]) => ({ path: value.trim(), error: cleanupError.message })));
+
+            logger.warn(`[UI API] Credential cleanup failed after deleting unhealthy providers from ${providerType}: ${cleanupError.message}`);
+            credentialCleanup = {
+                deletedFiles: [],
+                skippedFiles: [],
+                failedFiles: failedFiles.length > 0
+                    ? failedFiles
+                    : [{ path: providerType || 'credential_cleanup', error: cleanupError.message }]
+            };
+        }
+
         // 广播更新事件
         broadcastEvent('config_update', {
             action: 'delete_unhealthy',
@@ -1010,6 +1057,7 @@ async function _handleDeleteUnhealthyProviders(req, res, currentConfig, provider
             providerType,
             deletedCount: unhealthyProviders.length,
             deletedProviders: unhealthyProviders.map(p => sanitizeProviderData({ uuid: p.uuid, customName: p.customName })),
+            credentialCleanup,
             timestamp: new Date().toISOString()
         });
 
@@ -1019,7 +1067,8 @@ async function _handleDeleteUnhealthyProviders(req, res, currentConfig, provider
             message: `Successfully deleted ${unhealthyProviders.length} unhealthy providers`,
             deletedCount: unhealthyProviders.length,
             remainingCount: healthyProviders.length,
-            deletedProviders: unhealthyProviders.map(p => ({ uuid: p.uuid, customName: p.customName }))
+            deletedProviders: unhealthyProviders.map(p => ({ uuid: p.uuid, customName: p.customName })),
+            credentialCleanup
         }));
         return true;
     } catch (error) {

@@ -192,6 +192,11 @@ export function applyAccountQuotaLedgerToInstance(instanceResult, providerType, 
 
     const usage = instanceResult.usage || {};
     const existingSummary = usage.summary || {};
+    const displayResetAt = account.resetAt || (
+        account.refresh?.lastReason === 'reset_window_elapsed'
+            ? null
+            : existingSummary.resetAt || null
+    );
     const plan = account.plan || existingSummary.plan || null;
     const localStatus = getLocalUsageStatus(estimatedUsagePercent);
     const ledgerSummary = {
@@ -201,7 +206,7 @@ export function applyAccountQuotaLedgerToInstance(instanceResult, providerType, 
         lastRealUsagePercent,
         confidence: Number(account.confidence || 0),
         thresholdPercent: threshold,
-        resetAt: account.resetAt || existingSummary.resetAt || null,
+        resetAt: displayResetAt,
         disabledUntil: account.disabledUntil || null,
         recoveryAt: recovery.recoveryAt,
         recoverySource: recovery.recoverySource,

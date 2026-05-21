@@ -599,6 +599,55 @@ export class CodexApiService {
         }
     }
 
+    getCodexApiErrorStatus(apiError = {}) {
+        const explicitStatus = Number(apiError.status ?? apiError.status_code);
+        if (Number.isInteger(explicitStatus) && explicitStatus >= 100 && explicitStatus < 600) {
+            return explicitStatus;
+        }
+
+        const type = String(apiError.type || '').toLowerCase();
+        const code = String(apiError.code || '').toLowerCase();
+
+        if (type === 'insufficient_quota' || code === 'insufficient_quota' ||
+            type === 'rate_limit_error' || code === 'rate_limit_exceeded') {
+            return 429;
+        }
+        if (type === 'authentication_error' || code === 'unauthorized' || code === 'invalid_api_key') {
+            return 401;
+        }
+        if (type === 'permission_error' || code === 'forbidden') {
+            return 403;
+        }
+        if (type === 'invalid_request_error' || code === 'context_length_exceeded') {
+            return 400;
+        }
+
+        return 500;
+    }
+
+    createCodexApiError(parsed) {
+        const apiError = parsed?.error || parsed || {};
+        const errorMsg = apiError.message || JSON.stringify(apiError);
+        const error = new Error(`Codex API error: ${errorMsg}`);
+        error.status = this.getCodexApiErrorStatus(apiError);
+        error.statusCode = error.status;
+        error.type = apiError.type || 'api_error';
+        error.code = apiError.code || null;
+        error.apiErrorCode = apiError.code || null;
+        error.param = apiError.param;
+        error.upstreamError = apiError;
+
+        if (error.status >= 400 && error.status < 500) {
+            error.skipErrorCount = true;
+        }
+        if (error.status === 429) {
+            error.shouldSwitchCredential = true;
+            error.skipErrorCount = true;
+        }
+
+        return error;
+    }
+
     /**
      * 修正 Codex 完成输出
      */
@@ -657,14 +706,7 @@ export class CodexApiService {
 
                         if (parsed.type === 'error') {
                             logger.error('[Codex] API returned error in stream:', parsed.error || parsed);
-                            const errorMsg = (parsed.error && parsed.error.message) || JSON.stringify(parsed.error || parsed);
-                            const error = new Error(`Codex API error: ${errorMsg}`);
-                            if (parsed.error?.code === 'insufficient_quota' || parsed.error?.type === 'insufficient_quota') {
-                                error.status = 429;
-                                error.shouldSwitchCredential = true;
-                                error.skipErrorCount = true;
-                            }
-                            throw error;
+                            throw this.createCodexApiError(parsed);
                         }
 
                         if (parsed.type === 'response.output_item.done') {
@@ -695,14 +737,7 @@ export class CodexApiService {
 
                     if (parsed.type === 'error') {
                         logger.error('[Codex] API returned error in final stream buffer:', parsed.error || parsed);
-                        const errorMsg = (parsed.error && parsed.error.message) || JSON.stringify(parsed.error || parsed);
-                        const error = new Error(`Codex API error: ${errorMsg}`);
-                        if (parsed.error?.code === 'insufficient_quota' || parsed.error?.type === 'insufficient_quota') {
-                            error.status = 429;
-                            error.shouldSwitchCredential = true;
-                            error.skipErrorCount = true;
-                        }
-                        throw error;
+                        throw this.createCodexApiError(parsed);
                     }
 
                     if (parsed.type === 'response.output_item.done') {
@@ -761,14 +796,7 @@ export class CodexApiService {
                 switch (parsed.type) {
                     case 'error':
                         logger.error('[Codex] API returned error:', parsed.error || parsed);
-                        const errorMsg = (parsed.error && parsed.error.message) || JSON.stringify(parsed.error || parsed);
-                        const error = new Error(`Codex API error: ${errorMsg}`);
-                        if (parsed.error?.code === 'insufficient_quota' || parsed.error?.type === 'insufficient_quota') {
-                            error.status = 429;
-                            error.shouldSwitchCredential = true;
-                            error.skipErrorCount = true;
-                        }
-                        throw error;
+                        throw this.createCodexApiError(parsed);
                     case 'response.output_item.added':
                         if (parsed.item) {
                             outputItems.set(parsed.item.id, parsed.item);

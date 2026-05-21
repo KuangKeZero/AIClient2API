@@ -1983,7 +1983,18 @@ function createErrorResponse(error, fromProvider) {
         if (code >= 500) return 'server_error';
         return 'invalid_request_error';
     };
-    
+
+    const fallbackErrorType = getErrorType(statusCode);
+    const errorType = error.type || error.error?.type || fallbackErrorType;
+    const errorCode = error.apiErrorCode || error.errorCode || error.error?.code || fallbackErrorType;
+    const errorParam = error.param || error.error?.param;
+    const withErrorMetadata = (payload) => {
+        if (errorParam !== undefined && errorParam !== null) {
+            payload.param = errorParam;
+        }
+        return payload;
+    };
+
     // 根据 HTTP 状态码映射 Gemini 的 status
     const getGeminiStatus = (code) => {
         if (code === 400) return 'INVALID_ARGUMENT';
@@ -1999,31 +2010,31 @@ function createErrorResponse(error, fromProvider) {
         case MODEL_PROTOCOL_PREFIX.OPENAI:
             // OpenAI 非流式错误格式
             return {
-                error: {
+                error: withErrorMetadata({
                     message: errorMessage,
-                    type: getErrorType(statusCode),
-                    code: getErrorType(statusCode)  // OpenAI 使用 code 字段作为核心判断
-                }
+                    type: errorType,
+                    code: errorCode  // OpenAI 使用 code 字段作为核心判断
+                })
             };
             
         case MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES:
             // OpenAI Responses API 非流式错误格式
             return {
-                error: {
-                    type: getErrorType(statusCode),
+                error: withErrorMetadata({
+                    type: errorType,
                     message: errorMessage,
-                    code: getErrorType(statusCode)
-                }
+                    code: errorCode
+                })
             };
             
         case MODEL_PROTOCOL_PREFIX.CLAUDE:
             // Claude 非流式错误格式（外层有 type 标记）
             return {
                 type: "error",  // 核心区分标记
-                error: {
-                    type: getErrorType(statusCode),  // Claude 使用 error.type 作为核心判断
+                error: withErrorMetadata({
+                    type: errorType,  // Claude 使用 error.type 作为核心判断
                     message: errorMessage
-                }
+                })
             };
             
         case MODEL_PROTOCOL_PREFIX.GEMINI:
@@ -2039,11 +2050,11 @@ function createErrorResponse(error, fromProvider) {
         default:
             // 默认使用 OpenAI 格式
             return {
-                error: {
+                error: withErrorMetadata({
                     message: errorMessage,
-                    type: getErrorType(statusCode),
-                    code: getErrorType(statusCode)
-                }
+                    type: errorType,
+                    code: errorCode
+                })
             };
     }
 }
@@ -2068,6 +2079,17 @@ function createStreamErrorResponse(error, fromProvider) {
         if (code >= 500) return 'server_error';
         return 'invalid_request_error';
     };
+
+    const fallbackErrorType = getErrorType(statusCode);
+    const errorType = error.type || error.error?.type || fallbackErrorType;
+    const errorCode = error.apiErrorCode || error.errorCode || error.error?.code || fallbackErrorType;
+    const errorParam = error.param || error.error?.param;
+    const withErrorMetadata = (payload) => {
+        if (errorParam !== undefined && errorParam !== null) {
+            payload.param = errorParam;
+        }
+        return payload;
+    };
     
     // 根据 HTTP 状态码映射 Gemini 的 status
     const getGeminiStatus = (code) => {
@@ -2084,11 +2106,11 @@ function createStreamErrorResponse(error, fromProvider) {
         case MODEL_PROTOCOL_PREFIX.OPENAI:
             // OpenAI 流式错误格式（SSE data 块）
             const openaiError = {
-                error: {
+                error: withErrorMetadata({
                     message: errorMessage,
-                    type: getErrorType(statusCode),
-                    code: null
-                }
+                    type: errorType,
+                    code: errorCode
+                })
             };
             return `data: ${JSON.stringify(openaiError)}\n\n`;
             
@@ -2098,11 +2120,11 @@ function createStreamErrorResponse(error, fromProvider) {
                 id: `resp_${Date.now()}`,
                 object: "error",
                 created: Math.floor(Date.now() / 1000),
-                error: {
-                    type: getErrorType(statusCode),
+                error: withErrorMetadata({
+                    type: errorType,
                     message: errorMessage,
-                    code: getErrorType(statusCode)
-                }
+                    code: errorCode
+                })
             };
             return `event: error\ndata: ${JSON.stringify(responsesError)}\n\n`;
             
@@ -2110,10 +2132,10 @@ function createStreamErrorResponse(error, fromProvider) {
             // Claude 流式错误格式（SSE event + data）
             const claudeError = {
                 type: "error",
-                error: {
-                    type: getErrorType(statusCode),
+                error: withErrorMetadata({
+                    type: errorType,
                     message: errorMessage
-                }
+                })
             };
             return `event: error\ndata: ${JSON.stringify(claudeError)}\n\n`;
             
@@ -2133,11 +2155,11 @@ function createStreamErrorResponse(error, fromProvider) {
         default:
             // 默认使用 OpenAI SSE 格式
             const defaultError = {
-                error: {
+                error: withErrorMetadata({
                     message: errorMessage,
-                    type: getErrorType(statusCode),
-                    code: null
-                }
+                    type: errorType,
+                    code: errorCode
+                })
             };
             return `data: ${JSON.stringify(defaultError)}\n\n`;
     }
