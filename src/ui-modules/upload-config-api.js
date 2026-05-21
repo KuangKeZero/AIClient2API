@@ -7,6 +7,29 @@ import { broadcastEvent } from './event-broadcast.js';
 import { scanConfigFiles } from './config-scanner.js';
 import { cleanupUnboundConfigFileEntries } from './credential-cleanup.js';
 
+function mergeProviderPoolsForCleanup(...providerPoolSources) {
+    const mergedProviderPools = {};
+
+    for (const providerPools of providerPoolSources) {
+        if (!providerPools || typeof providerPools !== 'object') {
+            continue;
+        }
+
+        for (const [providerType, providers] of Object.entries(providerPools)) {
+            if (!Array.isArray(providers)) {
+                continue;
+            }
+
+            mergedProviderPools[providerType] = [
+                ...(mergedProviderPools[providerType] || []),
+                ...providers
+            ];
+        }
+    }
+
+    return mergedProviderPools;
+}
+
 /**
  * 获取上传配置文件列表
  */
@@ -265,7 +288,10 @@ export async function handleDeleteUnboundConfigs(req, res, currentConfig, provid
         const configFiles = await scanConfigFiles(currentConfig, providerPoolManager);
         
         const unboundConfigs = configFiles.filter(config => !config.isUsed);
-        const providerPools = providerPoolManager?.providerPools || currentConfig.providerPools || {};
+        const providerPools = mergeProviderPoolsForCleanup(
+            currentConfig?.providerPools,
+            providerPoolManager?.providerPools
+        );
         const credentialCleanup = await cleanupUnboundConfigFileEntries(
             unboundConfigs,
             currentConfig,

@@ -299,6 +299,85 @@ describe('provider API credential cleanup', () => {
         }));
     });
 
+    test('keeps unhealthy provider deletion successful when batch credential cleanup throws unexpectedly', async () => {
+        const providerPools = {
+            'openai-codex-oauth': [
+                {
+                    uuid: 'unhealthy-broken',
+                    customName: 'Unhealthy Broken',
+                    isHealthy: false,
+                    CODEX_OAUTH_CREDS_FILE_PATH: 'configs/codex/unhealthy-broken.json'
+                },
+                {
+                    uuid: 'healthy-keep',
+                    customName: 'Healthy Keep',
+                    isHealthy: true,
+                    CODEX_OAUTH_CREDS_FILE_PATH: 'configs/codex/healthy-keep.json'
+                }
+            ]
+        };
+        const currentConfig = {
+            PROVIDER_POOLS_FILE_PATH: 'configs/provider_pools.json'
+        };
+        Object.defineProperty(currentConfig, 'BROKEN_CREDS_FILE_PATH', {
+            enumerable: true,
+            get() {
+                throw new Error('batch cleanup boom');
+            }
+        });
+
+        const providerPoolManager = {
+            providerPools: {},
+            initializeProviderStatus: jest.fn()
+        };
+        const res = createJsonResponseMock();
+
+        await writeJson('configs/provider_pools.json', providerPools);
+        await writeFile(path.join(tempDir, 'configs/codex/unhealthy-broken.json'), '{}');
+        await writeFile(path.join(tempDir, 'configs/codex/healthy-keep.json'), '{}');
+
+        await handleDeleteUnhealthyProviders(
+            {},
+            res,
+            currentConfig,
+            providerPoolManager,
+            'openai-codex-oauth'
+        );
+
+        const body = JSON.parse(res.body);
+        const savedProviderPools = await readJson('configs/provider_pools.json');
+        const expectedCleanupFailure = {
+            deletedFiles: [],
+            skippedFiles: [],
+            failedFiles: [{ path: 'configs/codex/unhealthy-broken.json', error: 'batch cleanup boom' }]
+        };
+
+        expect(res.statusCode).toBe(200);
+        expect(body).toEqual(expect.objectContaining({
+            success: true,
+            deletedCount: 1,
+            remainingCount: 1,
+            credentialCleanup: expectedCleanupFailure
+        }));
+        expect(savedProviderPools).toEqual({
+            'openai-codex-oauth': [
+                {
+                    uuid: 'healthy-keep',
+                    customName: 'Healthy Keep',
+                    isHealthy: true,
+                    CODEX_OAUTH_CREDS_FILE_PATH: 'configs/codex/healthy-keep.json'
+                }
+            ]
+        });
+        expect(providerPoolManager.providerPools).toEqual(savedProviderPools);
+        expect(await fileExists('configs/codex/unhealthy-broken.json')).toBe(true);
+        expect(await fileExists('configs/codex/healthy-keep.json')).toBe(true);
+        expect(broadcastEvent).toHaveBeenCalledWith('config_update', expect.objectContaining({
+            action: 'delete_unhealthy',
+            credentialCleanup: expectedCleanupFailure
+        }));
+    });
+
     test('delete-unbound removes orphan provider credentials but keeps root config files', async () => {
         const currentConfig = {
             PROVIDER_POOLS_FILE_PATH: 'configs/provider_pools.json',
@@ -330,5 +409,47 @@ describe('provider API credential cleanup', () => {
         expect(await fileExists('configs/codex/orphan-upload.json')).toBe(false);
         expect(await fileExists('configs/config.json')).toBe(true);
         expect(await fileExists('configs/provider_pools.json')).toBe(true);
+    });
+
+    test('delete-unbound preserves credentials referenced by current config when provider pool manager is stale', async () => {
+        const currentConfig = {
+            PROVIDER_POOLS_FILE_PATH: 'configs/provider_pools.json',
+            providerPools: {
+                'openai-codex-oauth': [
+                    {
+                        uuid: 'current-config-used',
+                        customName: 'Current Config Used',
+                        CODEX_OAUTH_CREDS_FILE_PATH: 'configs/codex/used.json'
+                    }
+                ]
+            }
+        };
+        const providerPoolManager = {
+            providerPools: {}
+        };
+        const res = createJsonResponseMock();
+
+        await writeFile(path.join(tempDir, 'configs/codex/used.json'), '{}');
+        await writeJson('configs/provider_pools.json', {});
+
+        await handleDeleteUnboundConfigs({}, res, currentConfig, providerPoolManager);
+
+        const body = JSON.parse(res.body);
+
+        expect(res.statusCode).toBe(200);
+        expect(body).toEqual(expect.objectContaining({
+            success: true,
+            deletedCount: 0,
+            deletedFiles: [],
+            failedFiles: [],
+            skippedFiles: expect.arrayContaining([
+                { path: 'configs/codex/used.json', reason: 'still_referenced' }
+            ])
+        }));
+        expect(await fileExists('configs/codex/used.json')).toBe(true);
+        expect(await fileExists('configs/provider_pools.json')).toBe(true);
+        expect(broadcastEvent).not.toHaveBeenCalledWith('config_update', expect.objectContaining({
+            action: 'batch_delete'
+        }));
     });
 });
