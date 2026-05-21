@@ -5,6 +5,7 @@ import path from 'path';
 import AdmZip from 'adm-zip';
 import { broadcastEvent } from './event-broadcast.js';
 import { scanConfigFiles } from './config-scanner.js';
+import { cleanupUnboundConfigFileEntries } from './credential-cleanup.js';
 
 /**
  * 获取上传配置文件列表
@@ -263,81 +264,24 @@ export async function handleDeleteUnboundConfigs(req, res, currentConfig, provid
         // 首先获取所有配置文件及其绑定状态
         const configFiles = await scanConfigFiles(currentConfig, providerPoolManager);
         
-        // 筛选出未绑定的配置文件，并且必须在 configs/xxx/ 子目录下
-        // 即路径格式为 configs/子目录名/文件名，而不是直接在 configs/ 根目录下
-        const unboundConfigs = configFiles.filter(config => {
-            if (config.isUsed) return false;
-            
-            // 检查路径是否在 configs/xxx/ 子目录下
-            // 路径格式应该是 configs/子目录/...
-            const normalizedPath = config.path.replace(/\\/g, '/');
-            const pathParts = normalizedPath.split('/');
-            
-            // 路径至少需要3部分：configs/子目录/文件名
-            // 例如：configs/kiro/xxx.json 或 configs/gemini/xxx.json
-            if (pathParts.length >= 3 && pathParts[0] === 'configs') {
-                // 确保第二部分是子目录名（不是文件名）
-                return true;
-            }
-            
-            return false;
-        });
-        
-        if (unboundConfigs.length === 0) {
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({
-                success: true,
-                message: 'No unbound config files to delete',
-                deletedCount: 0,
-                deletedFiles: []
-            }));
-            return true;
-        }
-        
-        const deletedFiles = [];
-        const failedFiles = [];
-        
-        for (const config of unboundConfigs) {
-            try {
-                const fullPath = path.join(process.cwd(), config.path);
-                
-                // 安全检查：确保文件路径在允许的目录内
-                const allowedDirs = ['configs'];
-                const relativePath = path.relative(process.cwd(), fullPath);
-                const isAllowed = allowedDirs.some(dir => relativePath.startsWith(dir + path.sep) || relativePath === dir);
-                
-                if (!isAllowed) {
-                    failedFiles.push({
-                        path: config.path,
-                        error: 'Access denied: can only delete files in configs directory'
-                    });
-                    continue;
-                }
-                
-                if (!existsSync(fullPath)) {
-                    failedFiles.push({
-                        path: config.path,
-                        error: 'File does not exist'
-                    });
-                    continue;
-                }
-                
-                await fs.unlink(fullPath);
-                deletedFiles.push(config.path);
-                
-            } catch (error) {
-                failedFiles.push({
-                    path: config.path,
-                    error: error.message
-                });
-            }
-        }
+        const unboundConfigs = configFiles.filter(config => !config.isUsed);
+        const providerPools = providerPoolManager?.providerPools || currentConfig.providerPools || {};
+        const credentialCleanup = await cleanupUnboundConfigFileEntries(
+            unboundConfigs,
+            currentConfig,
+            providerPools
+        );
+
+        const deletedFiles = credentialCleanup.deletedFiles;
+        const failedFiles = credentialCleanup.failedFiles;
+        const skippedFiles = credentialCleanup.skippedFiles;
         
         // 广播更新事件
         if (deletedFiles.length > 0) {
             broadcastEvent('config_update', {
                 action: 'batch_delete',
                 deletedFiles: deletedFiles,
+                skippedFiles: skippedFiles,
                 timestamp: new Date().toISOString()
             });
         }
@@ -349,7 +293,9 @@ export async function handleDeleteUnboundConfigs(req, res, currentConfig, provid
             deletedCount: deletedFiles.length,
             deletedFiles: deletedFiles,
             failedCount: failedFiles.length,
-            failedFiles: failedFiles
+            failedFiles: failedFiles,
+            skippedCount: skippedFiles.length,
+            skippedFiles: skippedFiles
         }));
         return true;
     } catch (error) {

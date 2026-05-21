@@ -1027,6 +1027,29 @@ async function _handleDeleteUnhealthyProviders(req, res, currentConfig, provider
             providerPoolManager.initializeProviderStatus();
         }
 
+        let credentialCleanup;
+        try {
+            credentialCleanup = await cleanupCredentialFilesForDeletedProviders(
+                unhealthyProviders,
+                currentConfig,
+                providerPools
+            );
+        } catch (cleanupError) {
+            const failedFiles = unhealthyProviders
+                .flatMap(provider => Object.entries(provider || {})
+                    .filter(([key, value]) => /_(?:CREDS|TOKEN)_FILE_PATH$/.test(key) && typeof value === 'string' && value.trim())
+                    .map(([, value]) => ({ path: value.trim(), error: cleanupError.message })));
+
+            logger.warn(`[UI API] Credential cleanup failed after deleting unhealthy providers from ${providerType}: ${cleanupError.message}`);
+            credentialCleanup = {
+                deletedFiles: [],
+                skippedFiles: [],
+                failedFiles: failedFiles.length > 0
+                    ? failedFiles
+                    : [{ path: providerType || 'credential_cleanup', error: cleanupError.message }]
+            };
+        }
+
         // 广播更新事件
         broadcastEvent('config_update', {
             action: 'delete_unhealthy',
@@ -1034,6 +1057,7 @@ async function _handleDeleteUnhealthyProviders(req, res, currentConfig, provider
             providerType,
             deletedCount: unhealthyProviders.length,
             deletedProviders: unhealthyProviders.map(p => sanitizeProviderData({ uuid: p.uuid, customName: p.customName })),
+            credentialCleanup,
             timestamp: new Date().toISOString()
         });
 
@@ -1043,7 +1067,8 @@ async function _handleDeleteUnhealthyProviders(req, res, currentConfig, provider
             message: `Successfully deleted ${unhealthyProviders.length} unhealthy providers`,
             deletedCount: unhealthyProviders.length,
             remainingCount: healthyProviders.length,
-            deletedProviders: unhealthyProviders.map(p => ({ uuid: p.uuid, customName: p.customName }))
+            deletedProviders: unhealthyProviders.map(p => ({ uuid: p.uuid, customName: p.customName })),
+            credentialCleanup
         }));
         return true;
     } catch (error) {
