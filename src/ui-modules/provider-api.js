@@ -10,6 +10,7 @@ import {
 } from '../providers/provider-models.js';
 import { generateUUID, createProviderConfig, formatSystemPath, detectProviderFromPath, addToUsedPaths, isPathUsed, pathsEqual } from '../utils/provider-utils.js';
 import { broadcastEvent } from './event-broadcast.js';
+import { cleanupCredentialFilesForDeletedProviders } from './credential-cleanup.js';
 import { getRegisteredProviders, getServiceAdapter, invalidateServiceAdapter, serviceInstances } from '../providers/adapter.js';
 import { withFileLock, atomicWriteFile } from '../utils/file-lock.js';
 import { normalizeProviderConfigFields } from '../utils/provider-config-normalizer.js';
@@ -715,12 +716,19 @@ async function _handleDeleteProvider(req, res, currentConfig, providerPoolManage
             providerPoolManager.initializeProviderStatus();
         }
 
+        const credentialCleanup = await cleanupCredentialFilesForDeletedProviders(
+            [deletedProvider],
+            currentConfig,
+            providerPools
+        );
+
         // 广播更新事件
         broadcastEvent('config_update', {
             action: 'delete',
             filePath: filePath,
             providerType,
             providerConfig: sanitizeProviderData(deletedProvider),
+            credentialCleanup,
             timestamp: new Date().toISOString()
         });
 
@@ -728,7 +736,8 @@ async function _handleDeleteProvider(req, res, currentConfig, providerPoolManage
         res.end(JSON.stringify({
             success: true,
             message: 'Provider deleted successfully',
-            deletedProvider: sanitizeProviderData(deletedProvider)
+            deletedProvider: sanitizeProviderData(deletedProvider),
+            credentialCleanup
         }));
         return true;
     } catch (error) {
