@@ -139,4 +139,79 @@ describe('provider API credential cleanup', () => {
             credentialCleanup
         }));
     });
+
+    test('keeps provider deletion successful when credential cleanup throws unexpectedly', async () => {
+        const providerPools = {
+            'openai-codex-oauth': [
+                {
+                    uuid: 'delete-me',
+                    customName: 'Delete Me',
+                    CODEX_OAUTH_CREDS_FILE_PATH: 'configs/codex/delete-me.json'
+                },
+                {
+                    uuid: 'keep-me',
+                    customName: 'Keep Me',
+                    CODEX_OAUTH_CREDS_FILE_PATH: 'configs/codex/keep-me.json'
+                }
+            ]
+        };
+        const currentConfig = {
+            PROVIDER_POOLS_FILE_PATH: 'configs/provider_pools.json'
+        };
+        Object.defineProperty(currentConfig, 'BROKEN_CREDS_FILE_PATH', {
+            enumerable: true,
+            get() {
+                throw new Error('cleanup boom');
+            }
+        });
+
+        const providerPoolManager = {
+            providerPools: {},
+            initializeProviderStatus: jest.fn()
+        };
+        const res = createJsonResponseMock();
+
+        await writeJson('configs/provider_pools.json', providerPools);
+        await writeFile(path.join(tempDir, 'configs/codex/delete-me.json'), '{}');
+        await writeFile(path.join(tempDir, 'configs/codex/keep-me.json'), '{}');
+
+        await handleDeleteProvider(
+            {},
+            res,
+            currentConfig,
+            providerPoolManager,
+            'openai-codex-oauth',
+            'delete-me'
+        );
+
+        const body = JSON.parse(res.body);
+        const savedProviderPools = await readJson('configs/provider_pools.json');
+        const expectedCleanupFailure = {
+            deletedFiles: [],
+            skippedFiles: [],
+            failedFiles: [{ path: 'configs/codex/delete-me.json', error: 'cleanup boom' }]
+        };
+
+        expect(res.statusCode).toBe(200);
+        expect(body).toEqual(expect.objectContaining({
+            success: true,
+            credentialCleanup: expectedCleanupFailure
+        }));
+        expect(savedProviderPools).toEqual({
+            'openai-codex-oauth': [
+                {
+                    uuid: 'keep-me',
+                    customName: 'Keep Me',
+                    CODEX_OAUTH_CREDS_FILE_PATH: 'configs/codex/keep-me.json'
+                }
+            ]
+        });
+        expect(providerPoolManager.providerPools).toEqual(savedProviderPools);
+        expect(await fileExists('configs/codex/delete-me.json')).toBe(true);
+        expect(await fileExists('configs/codex/keep-me.json')).toBe(true);
+        expect(broadcastEvent).toHaveBeenCalledWith('config_update', expect.objectContaining({
+            action: 'delete',
+            credentialCleanup: expectedCleanupFailure
+        }));
+    });
 });

@@ -716,11 +716,26 @@ async function _handleDeleteProvider(req, res, currentConfig, providerPoolManage
             providerPoolManager.initializeProviderStatus();
         }
 
-        const credentialCleanup = await cleanupCredentialFilesForDeletedProviders(
-            [deletedProvider],
-            currentConfig,
-            providerPools
-        );
+        let credentialCleanup;
+        try {
+            credentialCleanup = await cleanupCredentialFilesForDeletedProviders(
+                [deletedProvider],
+                currentConfig,
+                providerPools
+            );
+        } catch (cleanupError) {
+            const failedCredentialPath = Object.entries(deletedProvider || {})
+                .find(([key, value]) => /_(?:CREDS|TOKEN)_FILE_PATH$/.test(key) && typeof value === 'string' && value.trim())?.[1]?.trim()
+                || providerUuid
+                || 'credential_cleanup';
+
+            logger.warn(`[UI API] Credential cleanup failed after deleting provider ${providerUuid} from ${providerType}: ${cleanupError.message}`);
+            credentialCleanup = {
+                deletedFiles: [],
+                skippedFiles: [],
+                failedFiles: [{ path: failedCredentialPath, error: cleanupError.message }]
+            };
+        }
 
         // 广播更新事件
         broadcastEvent('config_update', {
