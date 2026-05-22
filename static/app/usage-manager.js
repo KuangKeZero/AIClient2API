@@ -766,27 +766,57 @@ function createInstanceUsageCard(instance, providerType) {
     if (instance.error) {
         contentArea.innerHTML = `<div class="usage-error-message"><i class="fas fa-exclamation-triangle"></i> <span>${instance.error}</span></div>`;
     } else if (instance.usage) {
-        contentArea.appendChild(renderUsageDetails(instance.usage));
+        contentArea.appendChild(renderUsageDetails(instance.usage, providerType));
     }
 
     return card;
 }
 
+function resolveUsageSummaryDisplay(usage, providerType) {
+    const summary = usage?.summary || {};
+    const fallback = {
+        ...summary,
+        label: t('usage.card.totalUsage')
+    };
+
+    if (providerType !== 'openai-codex-oauth-plus' || !summary.displayLabel) {
+        return fallback;
+    }
+
+    const primaryItemId = summary.primaryItemId || 'primary_window';
+    const primaryItem = Array.isArray(usage?.items)
+        ? usage.items.find(item => item?.id === primaryItemId)
+        : null;
+
+    if (!primaryItem || primaryItem.percent === undefined) {
+        return fallback;
+    }
+
+    return {
+        ...summary,
+        label: summary.displayLabel,
+        usedPercent: primaryItem.percent,
+        status: primaryItem.status || summary.status,
+        resetAt: primaryItem.resetAt || summary.resetAt
+    };
+}
+
 /**
  * 渲染用量详情 (全面适配新结构)
  */
-function renderUsageDetails(usage) {
+function renderUsageDetails(usage, providerType) {
     const container = document.createElement('div');
     container.className = 'usage-details';
 
-    const { summary, items } = usage;
+    const { items } = usage;
+    const summary = resolveUsageSummaryDisplay(usage, providerType);
     
     if (summary?.usedPercent !== undefined) {
         const total = document.createElement('div');
         total.className = 'usage-section total-usage';
         total.innerHTML = `
             <div class="total-usage-header">
-                <span class="total-label"><i class="fas fa-chart-pie"></i> <span>${t('usage.card.totalUsage')}</span></span>
+                <span class="total-label"><i class="fas fa-chart-pie"></i> <span>${summary.label}</span></span>
                 <span class="total-value">${summary.usedPercent.toFixed(1)}%</span>
             </div>
             <div class="progress-bar ${summary.status}"><div class="progress-fill" style="width: ${summary.usedPercent}%"></div></div>
