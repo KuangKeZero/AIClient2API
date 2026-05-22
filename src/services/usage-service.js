@@ -606,6 +606,9 @@ export function formatGrokUsage(usageData) {
 /**
  * 格式化 Codex 用量
  */
+const CODEX_PRIMARY_WINDOW_ID = 'primary_window';
+const CODEX_PRIMARY_WINDOW_LABEL = 'Request Quota (5h)';
+
 export function formatCodexUsage(usageData) {
     if (!usageData) return null;
 
@@ -627,8 +630,8 @@ export function formatCodexUsage(usageData) {
         worstResetAtTimestamp = primary?.reset_at ?? primary?.resetAt;
         
         items.push({
-            id: 'primary_window',
-            label: 'Request Quota (5h)',
+            id: CODEX_PRIMARY_WINDOW_ID,
+            label: CODEX_PRIMARY_WINDOW_LABEL,
             used: primaryUsedPercent,
             limit: 100,
             percent: primaryUsedPercent,
@@ -667,7 +670,9 @@ export function formatCodexUsage(usageData) {
             resetAt: formatTimestamp(worstResetAtTimestamp),
             plan,
             planClass: getPlanClass(plan),
-            unit: 'percent'
+            unit: 'percent',
+            displayLabel: CODEX_PRIMARY_WINDOW_LABEL,
+            primaryItemId: CODEX_PRIMARY_WINDOW_ID
         },
         user: { 
             email: usageData.account || null

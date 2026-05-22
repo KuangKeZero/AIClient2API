@@ -1019,7 +1019,9 @@ describe('Usage API Codex Plus quota rules', () => {
         expect(usage.summary).toMatchObject({
             usedPercent: 26,
             plan: 'PLUS',
-            planClass: 'plan-plus'
+            planClass: 'plan-plus',
+            displayLabel: 'Request Quota (5h)',
+            primaryItemId: 'primary_window'
         });
         expect(usage.items).toEqual([
             expect.objectContaining({
