@@ -35,6 +35,7 @@ import {
     applyAccountQuotaLedgerToInstance,
     applyAccountQuotaLedgerToProviderUsage,
     buildProviderPoolUsageSyncStats,
+    handleGetProviderUsage,
     handleGetSupportedProviders,
     handleGetSingleInstanceUsage,
     handleGetUsage,
@@ -1300,6 +1301,108 @@ describe('Usage API Codex Plus quota rules', () => {
         expect(writeUsageCache).not.toHaveBeenCalled();
         expect(body.providers[providerType].instances[0].usage.items).toEqual(expect.arrayContaining([
             expect.objectContaining({ id: 'primary_window', percent: 26 })
+        ]));
+    });
+
+    test('refreshes provider usage when cached codex plus 5h quota has reset', async () => {
+        const providerType = 'openai-codex-oauth-plus';
+        const uuid = 'plus-stale-provider';
+        const cachedProviderUsage = buildCachedCodexPlusUsage(
+            providerType,
+            uuid,
+            buildCodexPlusRawUsage(92, '2020-01-01T05:00:00.000Z')
+        ).providers[providerType];
+
+        readProviderUsageCache.mockResolvedValue(cachedProviderUsage);
+        updateProviderUsageCache.mockResolvedValue(undefined);
+        serviceInstances[`${providerType}${uuid}`] = {
+            getUsageLimits: jest.fn().mockResolvedValue(
+                buildCodexPlusRawUsage(18, '2030-01-01T05:00:00.000Z')
+            )
+        };
+
+        const currentConfig = {
+            PROVIDER_POOLS_FILE_PATH: TEST_PROVIDER_POOLS_FILE_PATH,
+            providerPools: {
+                [providerType]: [{ uuid, isDisabled: false }]
+            }
+        };
+        const providerPoolManager = {
+            providerPools: currentConfig.providerPools
+        };
+        const req = {
+            method: 'GET',
+            url: `/api/usage/${providerType}`,
+            headers: { host: 'localhost:3000' }
+        };
+        const res = createJsonResponseMock();
+
+        const handled = await withMockedDateNow('2026-05-22T00:00:00.000Z', () => (
+            handleGetProviderUsage(req, res, currentConfig, providerPoolManager, providerType)
+        ));
+        const body = JSON.parse(res.body);
+
+        expect(handled).toBe(true);
+        expect(serviceInstances[`${providerType}${uuid}`].getUsageLimits).toHaveBeenCalledTimes(1);
+        expect(updateProviderUsageCache).toHaveBeenCalledTimes(1);
+        expect(body.fromCache).toBeUndefined();
+        expect(body.instances[0].usage.items).toEqual(expect.arrayContaining([
+            expect.objectContaining({ id: 'primary_window', percent: 18 })
+        ]));
+    });
+
+    test('refreshes single usage when cached codex plus 5h quota has reset', async () => {
+        const providerType = 'openai-codex-oauth-plus';
+        const uuid = 'plus-stale-instance';
+        const cachedProviderUsage = buildCachedCodexPlusUsage(
+            providerType,
+            uuid,
+            buildCodexPlusRawUsage(93, '2020-01-01T05:00:00.000Z')
+        ).providers[providerType];
+
+        readProviderUsageCache.mockResolvedValue(cachedProviderUsage);
+        readUsageCache.mockResolvedValue(null);
+        updateProviderUsageCache.mockResolvedValue(undefined);
+        serviceInstances[`${providerType}${uuid}`] = {
+            getUsageLimits: jest.fn().mockResolvedValue(
+                buildCodexPlusRawUsage(19, '2030-01-01T05:00:00.000Z')
+            )
+        };
+
+        const currentConfig = {
+            PROVIDER_POOLS_FILE_PATH: TEST_PROVIDER_POOLS_FILE_PATH,
+            providerPools: {
+                [providerType]: [{ uuid, isDisabled: false }]
+            }
+        };
+        const providerPoolManager = {
+            providerPools: currentConfig.providerPools
+        };
+        const req = {
+            method: 'GET',
+            url: `/api/usage/${providerType}/${uuid}`,
+            headers: { host: 'localhost:3000' }
+        };
+        const res = createJsonResponseMock();
+
+        const handled = await withMockedDateNow('2026-05-22T00:00:00.000Z', () => (
+            handleGetSingleInstanceUsage(
+                req,
+                res,
+                currentConfig,
+                providerPoolManager,
+                providerType,
+                uuid
+            )
+        ));
+        const body = JSON.parse(res.body);
+
+        expect(handled).toBe(true);
+        expect(serviceInstances[`${providerType}${uuid}`].getUsageLimits).toHaveBeenCalledTimes(1);
+        expect(updateProviderUsageCache).toHaveBeenCalledTimes(1);
+        expect(body.fromCache).toBeUndefined();
+        expect(body.usage.items).toEqual(expect.arrayContaining([
+            expect.objectContaining({ id: 'primary_window', percent: 19 })
         ]));
     });
 
