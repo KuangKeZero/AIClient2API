@@ -1042,6 +1042,15 @@ describe('Usage API Codex Plus quota rules', () => {
         };
     }
 
+    async function withMockedDateNow(nowIso, callback) {
+        const dateNowSpy = jest.spyOn(Date, 'now').mockReturnValue(Date.parse(nowIso));
+        try {
+            return await callback();
+        } finally {
+            dateNowSpy.mockRestore();
+        }
+    }
+
     test('formats codex plus weekly usage from the secondary rate-limit window', () => {
         const usage = formatCodexUsage({
             account: 'plus@example.com',
@@ -1240,7 +1249,9 @@ describe('Usage API Codex Plus quota rules', () => {
         };
         const res = createJsonResponseMock();
 
-        const handled = await handleGetUsage(req, res, currentConfig, providerPoolManager);
+        const handled = await withMockedDateNow('2026-05-22T00:00:00.000Z', () => (
+            handleGetUsage(req, res, currentConfig, providerPoolManager)
+        ));
         const body = JSON.parse(res.body);
 
         expect(handled).toBe(true);
@@ -1279,7 +1290,9 @@ describe('Usage API Codex Plus quota rules', () => {
         };
         const res = createJsonResponseMock();
 
-        const handled = await handleGetUsage(req, res, currentConfig, providerPoolManager);
+        const handled = await withMockedDateNow('2026-05-22T00:00:00.000Z', () => (
+            handleGetUsage(req, res, currentConfig, providerPoolManager)
+        ));
         const body = JSON.parse(res.body);
 
         expect(handled).toBe(true);
