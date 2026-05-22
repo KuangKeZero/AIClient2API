@@ -569,6 +569,37 @@ export function buildProviderPoolUsageSyncStats(beforeUsage, afterUsage, current
     };
 }
 
+function getCodexPlusPrimaryUsageItem(usage) {
+    const primaryItemId = usage?.summary?.primaryItemId || 'primary_window';
+    const items = Array.isArray(usage?.items) ? usage.items : [];
+    return items.find(item => item?.id === primaryItemId) || null;
+}
+
+function hasExpiredResetAt(resetAt, now = Date.now()) {
+    const resetAtMs = Date.parse(resetAt);
+    return Number.isFinite(resetAtMs) && resetAtMs <= now;
+}
+
+function hasExpiredCodexPlusInstanceUsage(providerType, instance, now = Date.now()) {
+    if (providerType !== CODEX_PLUS_PROVIDER) return false;
+
+    const primaryItem = getCodexPlusPrimaryUsageItem(instance?.usage);
+    return hasExpiredResetAt(primaryItem?.resetAt, now);
+}
+
+function hasExpiredCodexPlusProviderUsage(providerType, providerUsage, now = Date.now()) {
+    const instances = Array.isArray(providerUsage?.instances) ? providerUsage.instances : [];
+    return instances.some(instance => hasExpiredCodexPlusInstanceUsage(providerType, instance, now));
+}
+
+function hasExpiredCodexPlusUsageResults(usageResults, now = Date.now()) {
+    return hasExpiredCodexPlusProviderUsage(
+        CODEX_PLUS_PROVIDER,
+        usageResults?.providers?.[CODEX_PLUS_PROVIDER],
+        now
+    );
+}
+
 
 /**
  * 获取所有支持用量查询的提供商的用量信息
@@ -848,12 +879,18 @@ export async function handleGetUsage(req, res, currentConfig, providerPoolManage
             // 优先读取缓存
             const cachedData = await readUsageCache();
             if (cachedData) {
-                logger.info('[Usage API] Returning cached usage data');
-                usageResults = { ...cachedData, fromCache: true };
+                let cachedUsageResults = { ...cachedData, fromCache: true };
                 // 使用最新的格式化逻辑处理缓存的原始数据
-                reformatUsageResults(usageResults);
-                usageResults = syncUsageResultsWithProviderPools(usageResults, currentConfig, providerPoolManager);
-                applyAccountQuotaLedgerToUsageResults(usageResults, currentConfig, providerPoolManager);
+                reformatUsageResults(cachedUsageResults);
+                cachedUsageResults = syncUsageResultsWithProviderPools(cachedUsageResults, currentConfig, providerPoolManager);
+
+                if (hasExpiredCodexPlusUsageResults(cachedUsageResults)) {
+                    logger.info('[Usage API] Codex Plus 5h usage cache has reset; fetching fresh usage data');
+                } else {
+                    logger.info('[Usage API] Returning cached usage data');
+                    usageResults = cachedUsageResults;
+                    applyAccountQuotaLedgerToUsageResults(usageResults, currentConfig, providerPoolManager);
+                }
             } else {
                 logger.info('[Usage API] No usage cache found; returning local provider-pool snapshot');
                 usageResults = syncUsageResultsWithProviderPools(
@@ -985,7 +1022,9 @@ export async function handleGetSingleInstanceUsage(req, res, currentConfig, prov
             error: null
         };
 
-        if (!refresh) {
+        let shouldFetchFreshUsage = refresh;
+
+        if (!shouldFetchFreshUsage) {
             const cachedData = await readProviderUsageCache(providerType);
             if (cachedData) {
                 const syncedCachedData = syncProviderUsageWithProviderPool(
@@ -994,19 +1033,29 @@ export async function handleGetSingleInstanceUsage(req, res, currentConfig, prov
                     currentConfig,
                     providerPoolManager
                 );
-                instanceResult = syncedCachedData.instances.find(item => item.uuid === uuid) || createProviderPoolUsagePlaceholder(providerType, provider);
-                instanceResult.fromCache = true;
-                attachAccountQuotaLedgerSummary(syncedCachedData, currentConfig, providerPoolManager);
-                if (syncedCachedData.pendingRestoreAccounts) {
-                    instanceResult.pendingRestoreAccounts = syncedCachedData.pendingRestoreAccounts;
-                    instanceResult.pendingRestoreCount = syncedCachedData.pendingRestoreCount;
+                const cachedInstance = syncedCachedData.instances.find(item => item.uuid === uuid)
+                    || createProviderPoolUsagePlaceholder(providerType, provider);
+
+                if (hasExpiredCodexPlusInstanceUsage(providerType, cachedInstance)) {
+                    logger.info(`[Usage API] Codex Plus 5h usage cache has reset for ${providerType}:${uuid}; fetching fresh usage data`);
+                    shouldFetchFreshUsage = true;
+                } else {
+                    instanceResult = cachedInstance;
+                    instanceResult.fromCache = true;
+                    attachAccountQuotaLedgerSummary(syncedCachedData, currentConfig, providerPoolManager);
+                    if (syncedCachedData.pendingRestoreAccounts) {
+                        instanceResult.pendingRestoreAccounts = syncedCachedData.pendingRestoreAccounts;
+                        instanceResult.pendingRestoreCount = syncedCachedData.pendingRestoreCount;
+                    }
                 }
             } else {
                 instanceResult = createProviderPoolUsagePlaceholder(providerType, provider);
                 attachAccountQuotaLedgerSummary(instanceResult, currentConfig, providerPoolManager);
                 instanceResult.fromLocalProviderPool = true;
             }
-        } else {
+        }
+
+        if (shouldFetchFreshUsage) {
             logger.info(`[Usage API] Fetching fresh usage data for ${providerType}:${uuid}`);
 
             const providerKey = providerType + (provider.uuid || '');
@@ -1048,10 +1097,9 @@ export async function handleGetSingleInstanceUsage(req, res, currentConfig, prov
                     }
                 }
             }
-
         }
         // 如果刷新成功且有全局缓存，建议更新全局缓存（可选，这里先只返回单个结果）
-        if (refresh && instanceResult.success && instanceResult.usage) {
+        if (shouldFetchFreshUsage && instanceResult.success && instanceResult.usage) {
             try {
                 const cache = await readUsageCache();
                 if (cache && cache.providers && cache.providers[providerType]) {
@@ -1128,16 +1176,27 @@ export async function handleGetProviderUsage(req, res, currentConfig, providerPo
             // Prefer reading from cache
             const cachedData = await readProviderUsageCache(providerType);
             if (cachedData) {
-                logger.info(`[Usage API] Returning cached usage data for ${providerType}`);
-                usageResults = { ...cachedData, fromCache: true };
+                let cachedProviderUsage = { ...cachedData, fromCache: true };
                 
                 // 包装成 reformatUsageResults 期待的结构并重新格式化
-                const tempResults = { providers: { [providerType]: usageResults } };
+                const tempResults = { providers: { [providerType]: cachedProviderUsage } };
                 reformatUsageResults(tempResults);
-                usageResults = tempResults.providers[providerType];
-                usageResults = syncProviderUsageWithProviderPool(providerType, usageResults, currentConfig, providerPoolManager);
-                applyAccountQuotaLedgerToProviderUsage(providerType, usageResults, currentConfig, providerPoolManager);
-                attachAccountQuotaLedgerSummary(usageResults, currentConfig, providerPoolManager);
+                cachedProviderUsage = tempResults.providers[providerType];
+                cachedProviderUsage = syncProviderUsageWithProviderPool(
+                    providerType,
+                    cachedProviderUsage,
+                    currentConfig,
+                    providerPoolManager
+                );
+
+                if (hasExpiredCodexPlusProviderUsage(providerType, cachedProviderUsage)) {
+                    logger.info(`[Usage API] Codex Plus 5h usage cache has reset for ${providerType}; fetching fresh usage data`);
+                } else {
+                    logger.info(`[Usage API] Returning cached usage data for ${providerType}`);
+                    usageResults = cachedProviderUsage;
+                    applyAccountQuotaLedgerToProviderUsage(providerType, usageResults, currentConfig, providerPoolManager);
+                    attachAccountQuotaLedgerSummary(usageResults, currentConfig, providerPoolManager);
+                }
             } else {
                 logger.info(`[Usage API] No usage cache found for ${providerType}; returning local provider-pool snapshot`);
                 usageResults = syncProviderUsageWithProviderPool(
