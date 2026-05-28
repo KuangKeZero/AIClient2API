@@ -1360,6 +1360,22 @@ export class ProviderPoolManager {
         let availableAndHealthyProviders = availableProviders.filter(p =>
             p.config.isHealthy && !p.config.isDisabled && !p.config.needsRefresh
         );
+
+        const excludedUuids = new Set([
+            ...(Array.isArray(options.excludeUuids) ? options.excludeUuids : []),
+            ...(Array.isArray(options.excludedUuids) ? options.excludedUuids : [])
+        ].filter(Boolean).map(String));
+        if (excludedUuids.size > 0) {
+            const beforeExcludeCount = availableAndHealthyProviders.length;
+            availableAndHealthyProviders = availableAndHealthyProviders.filter(p =>
+                !excludedUuids.has(String(p.config.uuid || p.uuid))
+            );
+            const excludedCount = beforeExcludeCount - availableAndHealthyProviders.length;
+            if (excludedCount > 0) {
+                this._log('info', `[Retry Routing] Excluded ${excludedCount} provider(s) for ${providerType} during this retry attempt`);
+            }
+        }
+
         availableAndHealthyProviders = this._filterByQuotaLedger(providerType, availableAndHealthyProviders, now);
 
         // 如果指定了模型，则排除不支持该模型的提供商

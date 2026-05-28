@@ -89,4 +89,32 @@ describe('Codex API error handling', () => {
             skipErrorCount: true
         });
     });
+
+    test('treats missing first SSE event as retryable without counting provider errors', async () => {
+        service = new CodexApiService({});
+        const payload = {
+            type: 'response.created',
+            response: { id: 'resp_test' }
+        };
+        async function* delayedStream() {
+            await new Promise(resolve => setTimeout(resolve, 40));
+            yield `data: ${JSON.stringify(payload)}\n\n`;
+        }
+
+        let caught;
+        try {
+            for await (const _chunk of service.parseSSEStream(delayedStream(), { firstEventTimeoutMs: 5 })) {
+                // The stream should time out before the first SSE event arrives.
+            }
+        } catch (error) {
+            caught = error;
+        }
+
+        expect(caught).toMatchObject({
+            code: 'CODEX_FIRST_SSE_TIMEOUT',
+            isFirstSSETimeout: true,
+            shouldSwitchCredential: true,
+            skipErrorCount: true
+        });
+    });
 });

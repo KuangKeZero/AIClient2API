@@ -884,6 +884,11 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         const skipErrorCount = error.skipErrorCount === true;
         // 检查是否应该切换凭证（用于 429/5xx/402/403 等情况）
         const shouldSwitchCredential = error.shouldSwitchCredential === true;
+        const isFirstSSETimeout = error.isFirstSSETimeout === true;
+        const retryExcludeUuids = new Set(retryContext?.excludeUuids || []);
+        if (isFirstSSETimeout && pooluuid) {
+            retryExcludeUuids.add(pooluuid);
+        }
         
         // 检查凭证是否已在底层被标记为不健康（避免重复标记）
         let credentialMarkedUnhealthy = error.credentialMarkedUnhealthy === true;
@@ -929,15 +934,22 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         // 不再依赖状态码判断，只要凭证被标记不健康且可以重试，就尝试切换
         if (credentialMarkedUnhealthy && currentRetry < maxRetries && providerPoolManager && CONFIG) {
             // 增加10秒内的随机等待时间，避免所有请求同时切换凭证
-            const randomDelay = Math.floor(Math.random() * 10000); // 0-10000毫秒
-            logger.info(`[Stream Retry] Credential marked unhealthy. Waiting ${randomDelay}ms before retry ${currentRetry + 1}/${maxRetries} with different credential...`);
-            await new Promise(resolve => setTimeout(resolve, randomDelay));
+            const randomDelay = isFirstSSETimeout ? 0 : Math.floor(Math.random() * 10000); // 0-10000毫秒
+            const retryReason = isFirstSSETimeout ? 'first SSE timeout' : 'credential marked unhealthy';
+            logger.info(`[Stream Retry] ${retryReason}. Waiting ${randomDelay}ms before retry ${currentRetry + 1}/${maxRetries} with different credential...`);
+            if (randomDelay > 0) {
+                await new Promise(resolve => setTimeout(resolve, randomDelay));
+            }
             
             try {
                 // 动态导入以避免循环依赖
                 const { getApiServiceWithFallback } = await import('../services/service-manager.js');
                 // 使用 acquireSlot: true 以占用新凭证的并发插槽
-                const result = await getApiServiceWithFallback(CONFIG, model, { acquireSlot: true });
+                const retryOptions = { acquireSlot: true };
+                if (retryExcludeUuids.size > 0) {
+                    retryOptions.excludeUuids = [...retryExcludeUuids];
+                }
+                const result = await getApiServiceWithFallback(CONFIG, model, retryOptions);
                 
                 if (result && result.service) {
                     logger.info(`[Stream Retry] Switched to new credential: ${result.uuid} (provider: ${result.actualProviderType})`);
@@ -949,7 +961,8 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                         currentRetry: currentRetry + 1,
                         maxRetries,
                         clientDisconnected,  // 传递断开状态
-                        anyDataSent          // 传递数据发送状态
+                        anyDataSent,         // 传递数据发送状态
+                        excludeUuids: [...retryExcludeUuids]
                     };
                     
                     // 递归调用，使用新的服务

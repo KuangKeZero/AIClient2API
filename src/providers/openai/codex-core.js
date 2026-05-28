@@ -16,6 +16,7 @@ const baseModels = getProviderModels(MODEL_PROVIDER.CODEX_API);
 const fastModels = baseModels.map(m => `${m}-fast`);
 const CODEX_MODELS = [...new Set([...baseModels, ...fastModels])];
 const CODEX_VERSION = '0.130.0';
+const DEFAULT_FIRST_SSE_TIMEOUT_MS = 15000;
 export const IMAGE_MODELS = new Set(['gpt-image-2']);
 
 /**
@@ -261,12 +262,25 @@ export class CodexApiService {
         const url = `${this.baseUrl}/responses`;
         const body = await this.prepareRequestBody(selectedModel, requestBody, true);
         const headers = this.buildHeaders(body.prompt_cache_key, true);
+        const firstSSETimeoutMs = this.getFirstSSETimeoutMs();
+        const firstSSEDeadlineAt = firstSSETimeoutMs > 0 ? Date.now() + firstSSETimeoutMs : null;
+        const abortController = firstSSETimeoutMs > 0 ? new AbortController() : null;
+        let firstSSETimeoutFired = false;
+        let firstSSETimeout = null;
 
         try {
+            if (abortController && firstSSEDeadlineAt) {
+                firstSSETimeout = setTimeout(() => {
+                    firstSSETimeoutFired = true;
+                    abortController.abort(this.createFirstSSETimeoutError(firstSSETimeoutMs));
+                }, firstSSETimeoutMs);
+            }
+
             const config = {
                 headers,
                 responseType: 'stream',
-                timeout: 300000 // 5 分钟超时
+                timeout: 300000, // 5 分钟超时
+                ...(abortController ? { signal: abortController.signal } : {})
             };
 
             const axiosRequestConfig = {
@@ -279,8 +293,23 @@ export class CodexApiService {
 
             const response = await axios.request(axiosRequestConfig);
 
-            yield* this.parseSSEStream(response.data);
+            yield* this.parseSSEStream(response.data, {
+                firstEventDeadlineAt: firstSSEDeadlineAt,
+                firstEventTimeoutMs: firstSSETimeoutMs,
+                onFirstEvent: () => {
+                    if (firstSSETimeout) {
+                        clearTimeout(firstSSETimeout);
+                        firstSSETimeout = null;
+                    }
+                }
+            });
         } catch (error) {
+            if (firstSSETimeoutFired) {
+                throw this.createFirstSSETimeoutError(firstSSETimeoutMs);
+            }
+            if (error.isFirstSSETimeout) {
+                throw error;
+            }
             if (error.response?.status === 401) {
                 logger.info('[Codex] Received 401 during stream. Triggering background refresh...');
 
@@ -295,6 +324,10 @@ export class CodexApiService {
             } else {
                 logger.error(`[Codex] Error calling streaming API (Status: ${error.response?.status}, Code: ${error.code || 'N/A'}):`, error.message);
                 throw error;
+            }
+        } finally {
+            if (firstSSETimeout) {
+                clearTimeout(firstSSETimeout);
             }
         }
     }
@@ -330,6 +363,14 @@ export class CodexApiService {
         }
 
         return headers;
+    }
+
+    getFirstSSETimeoutMs() {
+        const configured = Number.parseInt(this.config.CODEX_FIRST_SSE_TIMEOUT_MS, 10);
+        if (Number.isFinite(configured) && configured >= 0) {
+            return configured;
+        }
+        return DEFAULT_FIRST_SSE_TIMEOUT_MS;
     }
 
     /**
@@ -625,6 +666,16 @@ export class CodexApiService {
         return 500;
     }
 
+    createFirstSSETimeoutError(timeoutMs) {
+        const error = new Error(`Codex first SSE event timeout after ${timeoutMs}ms`);
+        error.code = 'CODEX_FIRST_SSE_TIMEOUT';
+        error.isFirstSSETimeout = true;
+        error.shouldSwitchCredential = true;
+        error.skipErrorCount = true;
+        error.firstSSETimeoutMs = timeoutMs;
+        return error;
+    }
+
     createCodexApiError(parsed) {
         const apiError = parsed?.error || parsed || {};
         const errorMsg = apiError.message || JSON.stringify(apiError);
@@ -682,12 +733,78 @@ export class CodexApiService {
     /**
      * 解析 SSE 流
      */
-    async* parseSSEStream(stream) {
+    async* parseSSEStream(stream, options = {}) {
         let buffer = '';
         const outputItemsByIndex = new Map();
         const outputItemsFallback = [];
+        let firstEventSeen = false;
+        const iterator = stream[Symbol.asyncIterator]();
+        const firstEventTimeoutMs = Number.parseInt(options.firstEventTimeoutMs, 10);
+        const firstEventDeadlineAt = Number.isFinite(options.firstEventDeadlineAt)
+            ? options.firstEventDeadlineAt
+            : null;
 
-        for await (const chunk of stream) {
+        const markFirstEventSeen = () => {
+            if (firstEventSeen) return;
+            firstEventSeen = true;
+            if (typeof options.onFirstEvent === 'function') {
+                options.onFirstEvent();
+            }
+        };
+
+        const readNextChunk = async () => {
+            if (firstEventSeen || (!firstEventDeadlineAt && !(Number.isFinite(firstEventTimeoutMs) && firstEventTimeoutMs > 0))) {
+                return iterator.next();
+            }
+
+            const timeoutMs = firstEventDeadlineAt
+                ? Math.max(0, firstEventDeadlineAt - Date.now())
+                : firstEventTimeoutMs;
+
+            if (timeoutMs <= 0) {
+                throw this.createFirstSSETimeoutError(firstEventTimeoutMs);
+            }
+
+            let timeout;
+            try {
+                return await Promise.race([
+                    iterator.next(),
+                    new Promise((_, reject) => {
+                        timeout = setTimeout(() => {
+                            reject(this.createFirstSSETimeoutError(firstEventTimeoutMs));
+                        }, timeoutMs);
+                    })
+                ]);
+            } finally {
+                if (timeout) {
+                    clearTimeout(timeout);
+                }
+            }
+        };
+
+        while (true) {
+            let nextChunk;
+            try {
+                nextChunk = await readNextChunk();
+            } catch (error) {
+                if (error.isFirstSSETimeout) {
+                    if (typeof stream.destroy === 'function') {
+                        stream.destroy(error);
+                    }
+                    if (typeof iterator.return === 'function') {
+                        try {
+                            await iterator.return();
+                        } catch {}
+                    }
+                }
+                throw error;
+            }
+
+            if (nextChunk.done) {
+                break;
+            }
+
+            const chunk = nextChunk.value;
             buffer += chunk.toString();
             const lines = buffer.split('\n');
             buffer = lines.pop(); // 保留不完整的行
@@ -701,6 +818,7 @@ export class CodexApiService {
                 const dataStr = trimmedLine.slice(6).trim();
 
                 if (dataStr && dataStr !== '[DONE]') {
+                    markFirstEventSeen();
                     try {
                         let parsed = JSON.parse(dataStr);
 
@@ -732,6 +850,7 @@ export class CodexApiService {
             const dataStr = finalTrimmed.slice(6).trim();
 
             if (dataStr && dataStr !== '[DONE]') {
+                markFirstEventSeen();
                 try {
                     let parsed = JSON.parse(dataStr);
 

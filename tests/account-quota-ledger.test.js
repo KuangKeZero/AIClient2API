@@ -457,6 +457,45 @@ describe('ProviderPoolManager account quota integration', () => {
         expect(selected.uuid).toBe('idle');
     });
 
+    test('routes around uuids excluded for the current retry attempt', () => {
+        const baseline = createPoolManager({
+            'openai-codex-oauth': [
+                { uuid: 'aaa-timeout', isHealthy: true, isDisabled: false },
+                { uuid: 'zzz-retry', isHealthy: true, isDisabled: false }
+            ]
+        });
+        baseline.accountQuotaLedger.applyRealUsage('openai-codex-oauth', 'aaa-timeout', {
+            summary: { usedPercent: 10, plan: 'PLUS', resetAt: '2030-01-01T00:00:00.000Z' }
+        });
+        baseline.accountQuotaLedger.applyRealUsage('openai-codex-oauth', 'zzz-retry', {
+            summary: { usedPercent: 10, plan: 'PLUS', resetAt: '2030-01-01T00:00:00.000Z' }
+        });
+        expect(baseline._doSelectProvider('openai-codex-oauth', null, {
+            skipUsageCount: true
+        }).uuid).toBe('aaa-timeout');
+
+        const manager = createPoolManager({
+            'openai-codex-oauth': [
+                { uuid: 'aaa-timeout', isHealthy: true, isDisabled: false },
+                { uuid: 'zzz-retry', isHealthy: true, isDisabled: false }
+            ]
+        });
+        manager.accountQuotaLedger.applyRealUsage('openai-codex-oauth', 'aaa-timeout', {
+            summary: { usedPercent: 10, plan: 'PLUS', resetAt: '2030-01-01T00:00:00.000Z' }
+        });
+        manager.accountQuotaLedger.applyRealUsage('openai-codex-oauth', 'zzz-retry', {
+            summary: { usedPercent: 10, plan: 'PLUS', resetAt: '2030-01-01T00:00:00.000Z' }
+        });
+
+        const selected = manager._doSelectProvider('openai-codex-oauth', null, {
+            skipUsageCount: true,
+            excludeUuids: ['aaa-timeout']
+        });
+
+        expect(selected.uuid).toBe('zzz-retry');
+        expect(manager.providerStatus['openai-codex-oauth'][0].config.isHealthy).toBe(true);
+    });
+
     test('removes an account from the pool after one auth failure', () => {
         const manager = createPoolManager({
             'openai-codex-oauth': [
