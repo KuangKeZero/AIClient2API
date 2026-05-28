@@ -1130,21 +1130,7 @@ async saveCredentialsToFile(filePath, newData) {
             });
             
             if (filteredTools.length === 0) {
-                // 所有工具都被过滤掉了，添加一个占位工具
-                logger.info('[Kiro] All tools were filtered out, adding placeholder tool');
-                const placeholderTool = {
-                    toolSpecification: {
-                        name: "no_tool_available",
-                        description: "This is a placeholder tool when no other tools are available. It does nothing.",
-                        inputSchema: {
-                            json: {
-                                type: "object",
-                                properties: {}
-                            }
-                        }
-                    }
-                };
-                toolsContext = { tools: [placeholderTool] };
+                logger.info('[Kiro] All tools were filtered out; omitting tools from request');
             } else {
                 const MAX_DESCRIPTION_LENGTH = 9216;
 
@@ -1185,40 +1171,13 @@ async saveCredentialsToFile(filePath, newData) {
 
                 // 检查过滤后是否还有有效工具
                 if (kiroTools.length === 0) {
-                    logger.info('[Kiro] All tools were filtered out (empty descriptions), adding placeholder tool');
-                    const placeholderTool = {
-                        toolSpecification: {
-                            name: "no_tool_available",
-                            description: "This is a placeholder tool when no other tools are available. It does nothing.",
-                            inputSchema: {
-                                json: {
-                                    type: "object",
-                                    properties: {}
-                                }
-                            }
-                        }
-                    };
-                    toolsContext = { tools: [placeholderTool] };
+                    logger.info('[Kiro] All tools were filtered out (empty descriptions); omitting tools from request');
                 } else {
                     toolsContext = { tools: kiroTools };
                 }
             }
         } else {
-            // tools 为空或长度为 0 时，自动添加一个占位工具
-            logger.info('[Kiro] No tools provided, adding placeholder tool');
-            const placeholderTool = {
-                toolSpecification: {
-                    name: "no_tool_available",
-                    description: "This is a placeholder tool when no other tools are available. It does nothing.",
-                    inputSchema: {
-                        json: {
-                            type: "object",
-                            properties: {}
-                        }
-                    }
-                }
-            };
-            toolsContext = { tools: [placeholderTool] };
+            logger.info('[Kiro] No tools provided; omitting tools from request');
         }
 
         const history = [];
@@ -2048,7 +2007,7 @@ async saveCredentialsToFile(filePath, newData) {
             this._markCredentialNeedRefresh('Token near expiry in generateContent');
         }
         
-        const finalModel = MODEL_MAPPING[model] ? model : model;
+        const finalModel = MODEL_MAPPING[model] || model;
         logger.info(`[Kiro] Calling generateContent with model: ${finalModel}`);
         
         // Estimate input tokens before making the API call
@@ -2400,7 +2359,7 @@ async saveCredentialsToFile(filePath, newData) {
             this._markCredentialNeedRefresh('Token near expiry in generateContentStream');
         }
         
-        const finalModel = MODEL_MAPPING[model] ? model : model;
+        const finalModel = MODEL_MAPPING[model] || model;
         logger.info(`[Kiro] Calling generateContentStream with model: ${finalModel} (real streaming)`);
 
         let inputTokens = 0;
