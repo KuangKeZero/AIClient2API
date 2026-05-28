@@ -421,6 +421,10 @@ export async function handleUIApiRequests(method, pathParam, req, res, currentCo
         return await oauthApi.handleBatchImportCodexTokens(req, res);
     }
 
+    if (method === 'POST' && pathParam === '/api/codex/import-external-credentials') {
+        return await oauthApi.handleImportCodexExternalCredentials(req, res);
+    }
+
     if (method === 'POST' && pathParam === '/api/grok/batch-import-tokens') {
         return await oauthApi.handleBatchImportGrokTokens(req, res);
     }
@@ -455,6 +459,13 @@ export async function handleUIApiRequests(method, pathParam, req, res, currentCo
     if (method === 'POST' && togglePluginMatch) {
         const pluginName = decodeURIComponent(togglePluginMatch[1]);
         return await pluginApi.handleTogglePlugin(req, res, pluginName);
+    }
+
+    // Uninstall plugin
+    const uninstallPluginMatch = pathParam.match(/^\/api\/plugins\/(.+)$/);
+    if (method === 'DELETE' && uninstallPluginMatch) {
+        const pluginName = decodeURIComponent(uninstallPluginMatch[1]);
+        return await pluginApi.handleUninstallPlugin(req, res, pluginName);
     }
 
     // Custom models management
