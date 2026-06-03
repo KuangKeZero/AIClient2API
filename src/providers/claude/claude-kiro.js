@@ -135,14 +135,27 @@ async function acquireKiroRequestSlot(config) {
     };
 }
 
-function normalizeKiroToolInput(input) {
+function isEmptyPlainObject(value) {
+    return value &&
+        typeof value === 'object' &&
+        !Array.isArray(value) &&
+        Object.keys(value).length === 0;
+}
+
+function normalizeKiroToolInput(input, { omitEmptyObject = false } = {}) {
     if (input === undefined || input === null) {
         return '';
     }
     if (typeof input === 'string') {
+        if (omitEmptyObject && input.trim() === '{}') {
+            return '';
+        }
         return input;
     }
     if (typeof input === 'object') {
+        if (omitEmptyObject && isEmptyPlainObject(input)) {
+            return '';
+        }
         try {
             return JSON.stringify(input);
         } catch (e) {
@@ -198,6 +211,48 @@ function getContextTokensForModel(model, config = {}, fallbackModel = null) {
     }
 
     return MODEL_CONTEXT_TOKENS[model] || MODEL_CONTEXT_TOKENS[fallbackModel] || KIRO_CONSTANTS.TOTAL_CONTEXT_TOKENS;
+}
+
+function buildKiroUsageSummary(usageLimits) {
+    const breakdownList = Array.isArray(usageLimits?.usageBreakdownList)
+        ? usageLimits.usageBreakdownList
+        : (Array.isArray(usageLimits?.usageBreakdown) ? usageLimits.usageBreakdown : []);
+
+    if (breakdownList.length > 0) {
+        let totalUsed = 0;
+        let totalLimit = 0;
+        for (const breakdown of breakdownList) {
+            const used = Number(breakdown.currentUsageWithPrecision ?? breakdown.currentUsage ?? 0);
+            const limit = Number(breakdown.usageLimitWithPrecision ?? breakdown.usageLimit ?? 0);
+            if (Number.isFinite(used) && used > 0) {
+                totalUsed += used;
+            }
+            if (Number.isFinite(limit) && limit > 0) {
+                totalLimit += limit;
+            }
+        }
+
+        const usedPercent = totalLimit > 0 ? Math.min(100, (totalUsed / totalLimit) * 100) : 0;
+        const plan = usageLimits?.subscriptionInfo?.subscriptionTitle ||
+            usageLimits?.subscription?.title ||
+            undefined;
+
+        return {
+            usedPercent,
+            totalUsed,
+            totalLimit,
+            plan: typeof plan === 'string' ? plan.replace(/^KIRO\s+/i, '') : plan
+        };
+    }
+
+    const usedCount = Number(usageLimits?.usedCount ?? usageLimits?.currentUsage ?? 0);
+    const limitCount = Number(usageLimits?.limitCount ?? usageLimits?.usageLimit ?? 0);
+    const usedPercent = limitCount > 0 ? Math.min(100, (usedCount / limitCount) * 100) : 0;
+    return {
+        usedPercent,
+        totalUsed: Number.isFinite(usedCount) ? Math.max(0, usedCount) : 0,
+        totalLimit: Number.isFinite(limitCount) ? Math.max(0, limitCount) : 0
+    };
 }
 // 从 provider-models.js 获取支持的模型列表
 const KIRO_MODELS = getProviderModels(MODEL_PROVIDER.KIRO_API);
@@ -286,6 +341,38 @@ function findRealTag(text, tag, startIndex = 0) {
 function isWhitespaceOnly(text) {
     if (text === null || text === undefined) return true;
     return String(text).trim().length === 0;
+}
+
+function countOccurrences(text, marker) {
+    if (!text || !marker) return 0;
+    return text.split(marker).length - 1;
+}
+
+function hasMarkdownTableSeparator(text) {
+    return String(text || '')
+        .split(/\r?\n/)
+        .some(line => /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(line));
+}
+
+function looksLikeTruncatedKiroText(text) {
+    const trimmed = String(text || '').trimEnd();
+    if (!trimmed) return false;
+
+    if (countOccurrences(trimmed, '```') % 2 === 1) {
+        return true;
+    }
+
+    if (countOccurrences(trimmed, '**') % 2 === 1) {
+        return true;
+    }
+
+    const nonEmptyLines = trimmed.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+    const lastLine = nonEmptyLines[nonEmptyLines.length - 1] || '';
+    if (lastLine.startsWith('|') && !lastLine.endsWith('|') && hasMarkdownTableSeparator(trimmed)) {
+        return true;
+    }
+
+    return false;
 }
 
 /**
@@ -1610,7 +1697,7 @@ async saveCredentialsToFile(filePath, newData) {
                             };
                         }
                         if (eventData.input) {
-                            currentToolCallDict.function.arguments += normalizeKiroToolInput(eventData.input);
+                            currentToolCallDict.function.arguments += normalizeKiroToolInput(eventData.input, { omitEmptyObject: true });
                         }
                         if (eventData.stop) {
                             try {
@@ -1734,7 +1821,7 @@ async saveCredentialsToFile(filePath, newData) {
                 throw error;
             }
     
-            // Handle 402 (Payment Required / Quota Exceeded) - verify usage and mark as unhealthy with recovery time
+            // Handle 402 (Payment Required / Quota Exceeded) - verify real usage before disabling/switching.
             if (status === 402 && !isRetry) {
                 await this._handle402Error(error, 'callApi');
             }
@@ -1922,45 +2009,30 @@ async saveCredentialsToFile(filePath, newData) {
     }
 
     /**
-     * Helper method to mark the current credential as unhealthy with a scheduled recovery time
-     * Used for quota exhaustion (402) where quota resets at a specific time (e.g., 1st of next month)
-     * @param {string} reason - The reason for marking unhealthy
-     * @param {Error} [error] - Optional error object to attach the marker to
-     * @param {Date} [recoveryTime] - The time when the credential should be marked healthy again
-     * @returns {boolean} - Whether the credential was successfully marked as unhealthy
+     * Apply freshly queried Kiro usage to the provider pool.
+     * The pool manager decides whether a confirmed 100% real usage result should disable the credential.
+     * @param {Object} usageLimits - Raw Kiro usage response
+     * @returns {Object|null} Result from the provider pool manager
      * @private
      */
-    _markCredentialUnhealthyWithRecovery(reason, error = null, recoveryTime = null) {
+    _applyRealUsageToPool(usageLimits) {
         const poolManager = getProviderPoolManager();
-        if (poolManager && this.uuid) {
-            logger.info(`[Kiro] Marking credential ${this.uuid} as unhealthy with recovery time. Reason: ${reason}, Recovery: ${recoveryTime?.toISOString()}`);
-            poolManager.markProviderUnhealthyWithRecoveryTime(this.config.MODEL_PROVIDER || MODEL_PROVIDER.KIRO_API, {
-                uuid: this.uuid
-            }, reason, recoveryTime);
-            // Attach marker to error object to prevent duplicate marking in upper layers
-            if (error) {
-                error.credentialMarkedUnhealthy = true;
-            }
-            return true;
-        } else {
-            logger.warn(`[Kiro] Cannot mark credential as unhealthy: poolManager=${!!poolManager}, uuid=${this.uuid}`);
-            return false;
+        if (!poolManager || !this.uuid || typeof poolManager.applyKiroRealUsage !== 'function') {
+            return null;
         }
-    }
 
-    /**
-     * 计算下月1日 00:00:00 UTC 时间
-     * @returns {Date} 下月1日的 Date 对象
-     * @private
-     */
-    _getNextMonthFirstDay() {
-        const now = new Date();
-        return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1, 0, 0, 0, 0));
+        const providerType = this.config.MODEL_PROVIDER || MODEL_PROVIDER.KIRO_API;
+        // Avoid importing the shared usage service here; construct the small summary the pool manager needs.
+        const summary = buildKiroUsageSummary(usageLimits);
+        return poolManager.applyKiroRealUsage(providerType, this.uuid, {
+            summary,
+            raw: usageLimits
+        });
     }
 
     /**
      * 处理 402 错误（配额耗尽）
-     * 验证用量限制并标记凭证为不健康，设置恢复时间为下月1日
+     * 先刷新真实用量；确认 100% 时禁用节点，否则标记不健康并切换凭证。
      * @param {Error} error - 原始错误对象
      * @param {string} context - 错误发生的上下文（如 'callApi', 'stream'）
      * @throws {Error} 抛出带有切换凭证标记的错误
@@ -1971,17 +2043,17 @@ async saveCredentialsToFile(filePath, newData) {
         try {
             // Verify usage limits to confirm quota exhaustion
             const usageLimits = await this.getUsageLimits();
-            const isQuotaExhausted = usageLimits?.usedCount >= usageLimits?.limitCount;
-            
-            logger.info(`[Kiro] Quota confirmed exhausted: ${usageLimits?.usedCount}/${usageLimits?.limitCount}`);
-            // Calculate recovery time: 1st day of next month at 00:00:00 UTC
-            const nextMonth = this._getNextMonthFirstDay();
-            this._markCredentialUnhealthyWithRecovery('402 Payment Required - Quota Exhausted', error, nextMonth);
+            const poolUsage = this._applyRealUsageToPool(usageLimits);
+            const usedPercent = poolUsage?.usedPercent;
+            logger.info(`[Kiro] Real usage refreshed after 402: ${Number.isFinite(usedPercent) ? `${usedPercent.toFixed(2)}%` : 'unknown'}`);
+            if (!poolUsage?.disabled) {
+                this._markCredentialUnhealthy('402 Payment Required - Quota Exceeded', error);
+            } else if (error) {
+                error.credentialMarkedUnhealthy = true;
+            }
         } catch (usageError) {
             logger.warn('[Kiro] Failed to verify usage limits:', usageError.message);
-            // If we can't verify, still mark as unhealthy with recovery time
-            const nextMonth = this._getNextMonthFirstDay();
-            this._markCredentialUnhealthyWithRecovery('402 Payment Required - Quota Exceeded (unverified)', error, nextMonth);
+            this._markCredentialUnhealthy('402 Payment Required - Quota Exceeded (usage verification failed)', error);
         }
         // Mark error for credential switch without recording error count
         error.shouldSwitchCredential = true;
@@ -2082,13 +2154,13 @@ async saveCredentialsToFile(filePath, newData) {
      */
     parseAwsEventStreamBuffer(buffer) {
         const events = [];
-        let remaining = buffer;
         let searchStart = 0;
+        let consumedUntil = 0;
         
         while (true) {
             // 查找真正的 JSON payload 起始位置。AWS Event Stream 包含二进制头部，
             // payload 对象里的 key 顺序不稳定，所以不能依赖 {"input": 这类固定开头。
-            const jsonStart = remaining.indexOf('{', searchStart);
+            const jsonStart = buffer.indexOf('{', searchStart);
             if (jsonStart < 0) break;
             
             // 正确处理嵌套的 {} - 使用括号计数法
@@ -2097,8 +2169,8 @@ async saveCredentialsToFile(filePath, newData) {
             let inString = false;
             let escapeNext = false;
             
-            for (let i = jsonStart; i < remaining.length; i++) {
-                const char = remaining[i];
+            for (let i = jsonStart; i < buffer.length; i++) {
+                const char = buffer[i];
                 
                 if (escapeNext) {
                     escapeNext = false;
@@ -2130,15 +2202,22 @@ async saveCredentialsToFile(filePath, newData) {
             
             if (jsonEnd < 0) {
                 // 不完整的 JSON，保留在缓冲区等待更多数据
-                remaining = remaining.substring(jsonStart);
-                break;
+                return { events, remaining: buffer.substring(jsonStart) };
             }
             
-            const jsonStr = remaining.substring(jsonStart, jsonEnd + 1);
+            const jsonStr = buffer.substring(jsonStart, jsonEnd + 1);
             try {
                 const parsed = JSON.parse(jsonStr);
+                // 处理 Kiro 原生 thinking 事件。开启 thinking 时，Kiro 会把思考内容
+                // 放在 text/signature 事件中，而不是 content 事件中。
+                if (parsed.text !== undefined && !parsed.followupPrompt) {
+                    events.push({ type: 'thinking', data: String(parsed.text ?? '') });
+                }
+                else if (parsed.signature !== undefined && !parsed.followupPrompt) {
+                    events.push({ type: 'thinkingSignature', data: String(parsed.signature ?? '') });
+                }
                 // 处理 content 事件
-                if (parsed.content !== undefined && !parsed.followupPrompt) {
+                else if (parsed.content !== undefined && !parsed.followupPrompt) {
                     // 处理转义字符
                     let decodedContent = parsed.content;
                     // 无须处理转义的换行符，原来要处理是因为智能体返回的 content 需要通过换行符切割不同的json
@@ -2152,7 +2231,7 @@ async saveCredentialsToFile(filePath, newData) {
                         data: {
                             name: parsed.name,
                             toolUseId: parsed.toolUseId,
-                            input: normalizeKiroToolInput(parsed.input),
+                            input: normalizeKiroToolInput(parsed.input, { omitEmptyObject: true }),
                             stop: parsed.stop || false
                         }
                     });
@@ -2163,15 +2242,25 @@ async saveCredentialsToFile(filePath, newData) {
                         type: 'toolUseInput',
                         data: {
                             toolUseId: parsed.toolUseId,
-                            input: normalizeKiroToolInput(parsed.input)
+                            input: normalizeKiroToolInput(parsed.input, { omitEmptyObject: true })
                         }
                     });
+                    if (parsed.stop !== undefined && parsed.contextUsagePercentage === undefined) {
+                        events.push({
+                            type: 'toolUseStop',
+                            data: {
+                                toolUseId: parsed.toolUseId,
+                                stop: parsed.stop
+                            }
+                        });
+                    }
                 }
                 // 处理工具调用的结束事件（只有 stop 字段，且不包含 contextUsagePercentage）
                 else if (parsed.stop !== undefined && parsed.contextUsagePercentage === undefined) {
                     events.push({
                         type: 'toolUseStop',
                         data: {
+                            toolUseId: parsed.toolUseId,
                             stop: parsed.stop
                         }
                     });
@@ -2192,17 +2281,13 @@ async saveCredentialsToFile(filePath, newData) {
             }
             
             searchStart = jsonEnd + 1;
-            if (searchStart >= remaining.length) {
-                remaining = '';
+            consumedUntil = searchStart;
+            if (searchStart >= buffer.length) {
                 break;
             }
         }
         
-        // 如果 searchStart 有进展，截取剩余部分
-        if (searchStart > 0 && remaining.length > 0) {
-            remaining = remaining.substring(searchStart);
-        }
-        
+        const remaining = consumedUntil > 0 ? buffer.substring(consumedUntil) : buffer;
         return { events, remaining };
     }
 
@@ -2281,9 +2366,13 @@ async saveCredentialsToFile(filePath, newData) {
                         };
                         yield { type: 'toolUse', toolUse };
                     } else if (event.type === 'toolUseInput') {
-                        yield { type: 'toolUseInput', input: event.data.input };
+                        yield { type: 'toolUseInput', toolUseId: event.data.toolUseId, input: event.data.input };
                     } else if (event.type === 'toolUseStop') {
-                        yield { type: 'toolUseStop', stop: event.data.stop };
+                        yield { type: 'toolUseStop', toolUseId: event.data.toolUseId, stop: event.data.stop };
+                    } else if (event.type === 'thinking') {
+                        yield { type: 'thinking', thinking: event.data };
+                    } else if (event.type === 'thinkingSignature') {
+                        yield { type: 'thinkingSignature', signature: event.data };
                     } else if (event.type === 'contextUsage') {
                         yield { type: 'contextUsage', contextUsagePercentage: event.data.contextUsagePercentage };
                     }
@@ -2320,7 +2409,7 @@ async saveCredentialsToFile(filePath, newData) {
                 throw error;
             }
             
-            // Handle 402 (Payment Required / Quota Exceeded) - verify usage and mark as unhealthy with recovery time
+            // Handle 402 (Payment Required / Quota Exceeded) - verify real usage before disabling/switching.
             if (status === 402 && !isRetry) {
                 await this._handle402Error(error, 'stream');
             }
@@ -2422,6 +2511,7 @@ async saveCredentialsToFile(filePath, newData) {
             pendingTextBeforeThinking: '',
             inThinking: false,
             thinkingExtracted: false,
+            nativeThinkingActive: false,
             thinkingBlockIndex: null,
             textBlockIndex: null,
             nextBlockIndex: 0,
@@ -2496,6 +2586,18 @@ async saveCredentialsToFile(filePath, newData) {
             return events;
         };
 
+        const createThinkingSignatureDeltaEvents = (signature) => {
+            if (!signature) return [];
+            const events = [];
+            events.push(...ensureBlockStart('thinking'));
+            events.push({
+                type: "content_block_delta",
+                index: streamState.thinkingBlockIndex,
+                delta: { type: "signature_delta", signature }
+            });
+            return events;
+        };
+
         function* pushEvents(events) {
             for (const ev of events) {
                 yield ev;
@@ -2504,10 +2606,232 @@ async saveCredentialsToFile(filePath, newData) {
 
         try {
             let totalContent = '';
+            let totalNativeThinking = '';
             let outputTokens = 0;
             const toolCalls = [];
             let currentToolCall = null; // 用于累积结构化工具调用
             const toolUseBlockIndexes = new Map(); // toolUseId -> content block index
+            const toolCallStates = new Map(); // toolUseId -> pending/active tool state
+            let orphanToolInput = '';
+            let orphanToolStop = false;
+            let droppedInvalidToolCalls = 0;
+            const toolSchemaByName = new Map(
+                Array.isArray(requestBody.tools)
+                    ? requestBody.tools
+                        .filter(tool => tool && tool.name)
+                        .map(tool => [tool.name, tool])
+                    : []
+            );
+
+            const getToolRequiredFields = (toolName) => {
+                const tool = toolSchemaByName.get(toolName);
+                const required = Array.isArray(tool?.input_schema?.required)
+                    ? tool.input_schema.required
+                    : Array.isArray(tool?.inputSchema?.required)
+                        ? tool.inputSchema.required
+                        : Array.isArray(tool?.parameters?.required)
+                            ? tool.parameters.required
+                            : [];
+                return required;
+            };
+
+            const toolAllowsEmptyInput = (toolName) => {
+                if (!toolName || !toolSchemaByName.has(toolName)) {
+                    return false;
+                }
+                return getToolRequiredFields(toolName).length === 0;
+            };
+            const toolCallHasInput = (toolCall) => typeof toolCall?.input === 'string' && toolCall.input.length > 0;
+
+            const getToolInputProperties = (toolName) => {
+                const tool = toolSchemaByName.get(toolName);
+                return tool?.input_schema?.properties ||
+                    tool?.inputSchema?.properties ||
+                    tool?.parameters?.properties ||
+                    {};
+            };
+
+            const isValueCompatibleWithSchema = (value, schema) => {
+                if (!schema || typeof schema !== 'object') {
+                    return true;
+                }
+
+                const schemaTypes = Array.isArray(schema.type)
+                    ? schema.type
+                    : (schema.type ? [schema.type] : []);
+                if (schemaTypes.length === 0) {
+                    return true;
+                }
+
+                return schemaTypes.some((schemaType) => {
+                    switch (schemaType) {
+                        case 'string':
+                            return typeof value === 'string';
+                        case 'number':
+                            return typeof value === 'number' && Number.isFinite(value);
+                        case 'integer':
+                            return Number.isInteger(value);
+                        case 'boolean':
+                            return typeof value === 'boolean';
+                        case 'array':
+                            return Array.isArray(value);
+                        case 'object':
+                            return value !== null && typeof value === 'object' && !Array.isArray(value);
+                        case 'null':
+                            return value === null;
+                        default:
+                            return true;
+                    }
+                });
+            };
+
+            const parseToolCallInput = (toolCall) => {
+                if (!toolCall) {
+                    return { isValid: false, parsedInput: null };
+                }
+
+                const emptyAllowed = toolAllowsEmptyInput(toolCall.name);
+                if (!toolCallHasInput(toolCall)) {
+                    return emptyAllowed
+                        ? { isValid: true, parsedInput: {} }
+                        : { isValid: false, parsedInput: null };
+                }
+
+                try {
+                    const parsedInput = JSON.parse(toolCall.input);
+                    if (parsedInput === null || typeof parsedInput !== 'object' || Array.isArray(parsedInput)) {
+                        return { isValid: false, parsedInput: null };
+                    }
+
+                    const requiredFields = getToolRequiredFields(toolCall.name);
+                    if (requiredFields.length > 0) {
+                        const properties = getToolInputProperties(toolCall.name);
+                        for (const field of requiredFields) {
+                            if (!Object.prototype.hasOwnProperty.call(parsedInput, field)) {
+                                return { isValid: false, parsedInput: null };
+                            }
+                            const value = parsedInput[field];
+                            if (value === undefined || value === null || value === '') {
+                                return { isValid: false, parsedInput: null };
+                            }
+                            if (!isValueCompatibleWithSchema(value, properties[field])) {
+                                return { isValid: false, parsedInput: null };
+                            }
+                        }
+                    }
+
+                    return { isValid: true, parsedInput };
+                } catch (e) {
+                    return { isValid: false, parsedInput: null };
+                }
+            };
+
+            const getToolCallState = (toolUseId) => {
+                if (!toolUseId) return null;
+                let state = toolCallStates.get(toolUseId);
+                if (!state) {
+                    state = {
+                        toolUseId,
+                        name: '',
+                        input: '',
+                        blockStarted: false,
+                        blockIndex: null,
+                        stopped: false,
+                        finalized: false
+                    };
+                    toolCallStates.set(toolUseId, state);
+                }
+                return state;
+            };
+
+            const startToolCallBlock = (toolCall, toolEvents) => {
+                if (!toolCall || toolCall.blockStarted) {
+                    return toolCall?.blockIndex ?? null;
+                }
+
+                toolEvents.push(...stopBlock(streamState.textBlockIndex));
+                const blockIndex = streamState.nextBlockIndex++;
+                toolCall.blockStarted = true;
+                toolCall.blockIndex = blockIndex;
+                toolUseBlockIndexes.set(toolCall.toolUseId, blockIndex);
+                toolEvents.push({
+                    type: "content_block_start",
+                    index: blockIndex,
+                    content_block: {
+                        type: "tool_use",
+                        id: toolCall.toolUseId || `tool_${uuidv4()}`,
+                        name: toolCall.name,
+                        input: {}
+                    }
+                });
+                return blockIndex;
+            };
+
+            const finalizeToolCall = (toolCall, toolEvents, { dropEmpty = false } = {}) => {
+                if (!toolCall || toolCall.finalized) {
+                    return false;
+                }
+
+                if (!toolCall.name) {
+                    if (dropEmpty) {
+                        logger.warn(`[Kiro Stream] Dropping incomplete tool call (${toolCall.toolUseId}) because tool name never arrived`);
+                        droppedInvalidToolCalls++;
+                        toolCall.finalized = true;
+                        if (currentToolCall && currentToolCall.toolUseId === toolCall.toolUseId) {
+                            currentToolCall = null;
+                        }
+                        return true;
+                    }
+                    return false;
+                }
+
+                const { isValid, parsedInput } = parseToolCallInput(toolCall);
+
+                if (!isValid) {
+                    if (dropEmpty) {
+                        logger.warn(`[Kiro Stream] Dropping invalid tool call '${toolCall.name}' (${toolCall.toolUseId}) because required input never arrived or failed validation`);
+                        droppedInvalidToolCalls++;
+                        toolCall.finalized = true;
+                        if (currentToolCall && currentToolCall.toolUseId === toolCall.toolUseId) {
+                            currentToolCall = null;
+                        }
+                        return true;
+                    }
+                    return false;
+                }
+
+                if (!toolCall.blockStarted) {
+                    startToolCallBlock(toolCall, toolEvents);
+                    const blockIndex = toolUseBlockIndexes.get(toolCall.toolUseId);
+                    if (blockIndex != null) {
+                        toolEvents.push({
+                            type: "content_block_delta",
+                            index: blockIndex,
+                            delta: {
+                                type: "input_json_delta",
+                                partial_json: JSON.stringify(parsedInput)
+                            }
+                        });
+                    }
+                }
+
+                toolCalls.push({
+                    toolUseId: toolCall.toolUseId,
+                    name: toolCall.name,
+                    input: parsedInput
+                });
+
+                const blockIndex = toolUseBlockIndexes.get(toolCall.toolUseId);
+                if (blockIndex != null) {
+                    toolEvents.push({ type: "content_block_stop", index: blockIndex });
+                    toolUseBlockIndexes.delete(toolCall.toolUseId);
+                }
+                toolCall.finalized = true;
+                if (currentToolCall && currentToolCall.toolUseId === toolCall.toolUseId) {
+                    currentToolCall = null;
+                }
+                return true;
+            };
 
             const estimatedInputTokens = this.estimateInputTokens(requestBody);
 
@@ -2534,7 +2858,35 @@ async saveCredentialsToFile(filePath, newData) {
                 if (event.type === 'contextUsage' && event.contextUsagePercentage) {
                     // 捕获上下文使用百分比（包含输入和输出的总使用量）
                     contextUsagePercentage = event.contextUsagePercentage;
+                } else if (event.type === 'thinking') {
+                    if (thinkingRequested) {
+                        if (event.thinking) {
+                            totalNativeThinking += event.thinking;
+                        }
+                        if (streamState.pendingTextBeforeThinking && !isWhitespaceOnly(streamState.pendingTextBeforeThinking)) {
+                            yield* pushEvents(createTextDeltaEvents(streamState.pendingTextBeforeThinking));
+                        }
+                        streamState.pendingTextBeforeThinking = '';
+                        streamState.nativeThinkingActive = true;
+                        streamState.thinkingExtracted = true;
+                        yield* pushEvents(createThinkingDeltaEvents(event.thinking));
+                    } else if (event.thinking) {
+                        totalContent += event.thinking;
+                        yield* pushEvents(createTextDeltaEvents(event.thinking));
+                    }
+                } else if (event.type === 'thinkingSignature') {
+                    if (thinkingRequested) {
+                        yield* pushEvents(createThinkingSignatureDeltaEvents(event.signature));
+                        yield* pushEvents(stopBlock(streamState.thinkingBlockIndex));
+                        streamState.nativeThinkingActive = false;
+                        streamState.stripTextLeadingNewlinesAfterThinking = true;
+                    }
                 } else if (event.type === 'content' && event.content) {
+                    if (thinkingRequested && streamState.nativeThinkingActive) {
+                        yield* pushEvents(stopBlock(streamState.thinkingBlockIndex));
+                        streamState.nativeThinkingActive = false;
+                        streamState.stripTextLeadingNewlinesAfterThinking = true;
+                    }
                     totalContent += event.content;
 
                     if (!thinkingRequested) {
@@ -2651,96 +3003,35 @@ async saveCredentialsToFile(filePath, newData) {
                 } else if (event.type === 'toolUse') {
                     const tc = event.toolUse;
                     const toolEvents = [];
+                    const toolState = getToolCallState(tc.toolUseId);
+                    const inputDelta = normalizeKiroToolInput(tc.input, { omitEmptyObject: true });
 
                     // 统计工具调用的内容到 totalContent（用于 token 计算）
                     if (tc.name) totalContent += tc.name;
-                    if (tc.input) totalContent += tc.input;
+                    if (inputDelta) totalContent += inputDelta;
 
                     // 工具调用事件（包含 name 和 toolUseId）
                     if (tc.name && tc.toolUseId) {
-                        // 遇到工具调用时，立即关闭文本块，避免前端等待到流结束才看到 content_block_stop
-                        toolEvents.push(...stopBlock(streamState.textBlockIndex));
-
-                        // 同一工具调用续传
-                        if (currentToolCall && currentToolCall.toolUseId === tc.toolUseId) {
-                            currentToolCall.input += tc.input || '';
-                        } else {
-                            // 切换到新的工具调用前，先收尾旧调用
-                            if (currentToolCall) {
-                                const prevBlockIndex = toolUseBlockIndexes.get(currentToolCall.toolUseId);
-                                let parsedInput = currentToolCall.input;
-                                try {
-                                    parsedInput = JSON.parse(currentToolCall.input);
-                                } catch (e) {
-                                    // input 不是有效 JSON，保持原样
-                                }
-                                toolCalls.push({
-                                    toolUseId: currentToolCall.toolUseId,
-                                    name: currentToolCall.name,
-                                    input: parsedInput
-                                });
-                                if (prevBlockIndex != null) {
-                                    toolEvents.push({ type: "content_block_stop", index: prevBlockIndex });
-                                    toolUseBlockIndexes.delete(currentToolCall.toolUseId);
-                                }
-                            }
-
-                            const blockIndex = streamState.nextBlockIndex++;
-                            toolUseBlockIndexes.set(tc.toolUseId, blockIndex);
-                            toolEvents.push({
-                                type: "content_block_start",
-                                index: blockIndex,
-                                content_block: {
-                                    type: "tool_use",
-                                    id: tc.toolUseId || `tool_${uuidv4()}`,
-                                    name: tc.name,
-                                    input: {}
-                                }
-                            });
-
-                            currentToolCall = {
-                                toolUseId: tc.toolUseId,
-                                name: tc.name,
-                                input: ''
-                            };
-                            currentToolCall.input += tc.input || '';
+                        if (currentToolCall && currentToolCall.toolUseId !== tc.toolUseId && !currentToolCall.finalized) {
+                            finalizeToolCall(currentToolCall, toolEvents, { dropEmpty: true });
                         }
 
-                        // 实时向前端推送工具参数增量
-                        if (tc.input) {
-                            const blockIndex = toolUseBlockIndexes.get(tc.toolUseId);
-                            if (blockIndex != null) {
-                                toolEvents.push({
-                                    type: "content_block_delta",
-                                    index: blockIndex,
-                                    delta: {
-                                        type: "input_json_delta",
-                                        partial_json: tc.input
-                                    }
-                                });
-                            }
+                        currentToolCall = toolState;
+                        currentToolCall.name = tc.name;
+                        if (orphanToolInput) {
+                            currentToolCall.input += orphanToolInput;
+                            orphanToolInput = '';
+                        }
+                        if (inputDelta) {
+                            currentToolCall.input += inputDelta;
                         }
 
-                        // 如果这个事件包含 stop，立即结束当前工具块
-                        if (tc.stop && currentToolCall) {
-                            let parsedInput = currentToolCall.input;
-                            try {
-                                parsedInput = JSON.parse(currentToolCall.input);
-                            } catch (e) {
-                                // input 不是有效 JSON，保持原样
-                            }
-                            toolCalls.push({
-                                toolUseId: currentToolCall.toolUseId,
-                                name: currentToolCall.name,
-                                input: parsedInput
-                            });
-
-                            const blockIndex = toolUseBlockIndexes.get(currentToolCall.toolUseId);
-                            if (blockIndex != null) {
-                                toolEvents.push({ type: "content_block_stop", index: blockIndex });
-                                toolUseBlockIndexes.delete(currentToolCall.toolUseId);
-                            }
-                            currentToolCall = null;
+                        if (tc.stop || orphanToolStop) {
+                            currentToolCall.stopped = true;
+                            orphanToolStop = false;
+                        }
+                        if (currentToolCall.stopped && (toolCallHasInput(currentToolCall) || toolAllowsEmptyInput(currentToolCall.name))) {
+                            finalizeToolCall(currentToolCall, toolEvents, { dropEmpty: true });
                         }
                     }
 
@@ -2749,67 +3040,64 @@ async saveCredentialsToFile(filePath, newData) {
                     }
                 } else if (event.type === 'toolUseInput') {
                     // 工具调用的 input 续传事件
-                    const inputDelta = normalizeKiroToolInput(event.input);
+                    const inputDelta = normalizeKiroToolInput(event.input, { omitEmptyObject: true });
                     // 统计 input 内容到 totalContent（用于 token 计算）
                     if (inputDelta) {
                         totalContent += inputDelta;
                     }
-                    if (currentToolCall) {
-                        currentToolCall.input += inputDelta;
-                        const blockIndex = toolUseBlockIndexes.get(currentToolCall.toolUseId);
-                        if (blockIndex != null && inputDelta) {
-                            yield* pushEvents([{
-                                type: "content_block_delta",
-                                index: blockIndex,
-                                delta: {
-                                    type: "input_json_delta",
-                                    partial_json: inputDelta
-                                }
-                            }]);
+                    const toolState = getToolCallState(event.toolUseId || currentToolCall?.toolUseId);
+                    if (toolState) {
+                        toolState.input += inputDelta;
+                        const toolEvents = [];
+                        if (toolState.stopped && toolState.name && (toolCallHasInput(toolState) || toolAllowsEmptyInput(toolState.name))) {
+                            finalizeToolCall(toolState, toolEvents, { dropEmpty: true });
                         }
+                        if (toolEvents.length > 0) {
+                            yield* pushEvents(toolEvents);
+                        }
+                    } else if (inputDelta) {
+                        orphanToolInput += inputDelta;
                     }
                 } else if (event.type === 'toolUseStop') {
                     // 工具调用结束事件
-                    if (currentToolCall && event.stop) {
-                        let parsedInput = currentToolCall.input;
-                        try {
-                            parsedInput = JSON.parse(currentToolCall.input);
-                        } catch (e) {
-                            // input 不是有效 JSON，保持原样
+                    const toolState = getToolCallState(event.toolUseId || currentToolCall?.toolUseId);
+                    if (toolState && event.stop) {
+                        toolState.stopped = true;
+                        if (toolState.name && (toolCallHasInput(toolState) || toolAllowsEmptyInput(toolState.name))) {
+                            const toolEvents = [];
+                            finalizeToolCall(toolState, toolEvents, { dropEmpty: true });
+                            if (toolEvents.length > 0) {
+                                yield* pushEvents(toolEvents);
+                            }
                         }
-                        toolCalls.push({
-                            toolUseId: currentToolCall.toolUseId,
-                            name: currentToolCall.name,
-                            input: parsedInput
-                        });
-
-                        const blockIndex = toolUseBlockIndexes.get(currentToolCall.toolUseId);
-                        if (blockIndex != null) {
-                            yield* pushEvents([{ type: "content_block_stop", index: blockIndex }]);
-                            toolUseBlockIndexes.delete(currentToolCall.toolUseId);
-                        }
-                        currentToolCall = null;
+                    } else if (event.stop) {
+                        orphanToolStop = true;
                     }
                 }
             }
             
             // 处理未完成的工具调用（如果流提前结束）
-            if (currentToolCall) {
-                let parsedInput = currentToolCall.input;
-                try {
-                    parsedInput = JSON.parse(currentToolCall.input);
-                } catch (e) {}
-                toolCalls.push({
-                    toolUseId: currentToolCall.toolUseId,
-                    name: currentToolCall.name,
-                    input: parsedInput
-                });
-                const blockIndex = toolUseBlockIndexes.get(currentToolCall.toolUseId);
-                if (blockIndex != null) {
-                    yield* pushEvents([{ type: "content_block_stop", index: blockIndex }]);
-                    toolUseBlockIndexes.delete(currentToolCall.toolUseId);
+            if (toolCallStates.size > 0) {
+                for (const toolState of toolCallStates.values()) {
+                    if (toolState.finalized) {
+                        continue;
+                    }
+
+                    const toolEvents = [];
+                    if (toolState.name) {
+                        finalizeToolCall(toolState, toolEvents, { dropEmpty: true });
+                    } else {
+                        logger.warn(`[Kiro Stream] Dropping incomplete tool call '${toolState.name}' (${toolState.toolUseId}) because required input never arrived`);
+                        toolState.finalized = true;
+                        if (currentToolCall && currentToolCall.toolUseId === toolState.toolUseId) {
+                            currentToolCall = null;
+                        }
+                    }
+
+                    if (toolEvents.length > 0) {
+                        yield* pushEvents(toolEvents);
+                    }
                 }
-                currentToolCall = null;
             }
 
             if (thinkingRequested && (streamState.inThinking || streamState.buffer || streamState.pendingTextBeforeThinking)) {
@@ -2847,13 +3135,25 @@ async saveCredentialsToFile(filePath, newData) {
                 streamState.buffer = '';
             }
 
+            if (streamState.nativeThinkingActive) {
+                yield* pushEvents(stopBlock(streamState.thinkingBlockIndex));
+                streamState.nativeThinkingActive = false;
+            }
+
+            const emittedInvalidToolContinuation = droppedInvalidToolCalls > 0 && toolCalls.length === 0;
+            if (emittedInvalidToolContinuation) {
+                logger.warn('[Kiro Stream] Invalid tool call omitted; ending turn without max_tokens to avoid continuation loop');
+                if (!streamState.hasVisibleText && !streamState.hasThinkingContent) {
+                    yield* pushEvents(createTextDeltaEvents('Tool call was omitted because required parameters were incomplete. Please retry.'));
+                }
+            }
+
             const emittedOnlyThinking = thinkingRequested &&
                 streamState.hasThinkingContent &&
                 !streamState.hasVisibleText &&
                 toolCalls.length === 0;
-            if (emittedOnlyThinking) {
-                logger.warn('[Kiro Stream] Thinking-only response received; emitting minimal text block and max_tokens stop_reason');
-                yield* pushEvents(createTextDeltaEvents(' '));
+            if (emittedOnlyThinking && !emittedInvalidToolContinuation) {
+                logger.warn('[Kiro Stream] Thinking-only response received; ending turn without max_tokens to avoid continuation loop');
             }
 
             yield* pushEvents(stopBlock(streamState.textBlockIndex));
@@ -2870,6 +3170,16 @@ async saveCredentialsToFile(filePath, newData) {
                 }
             }
 
+            const emittedTruncatedTextContinuation = !emittedInvalidToolContinuation &&
+                !emittedOnlyThinking &&
+                toolCalls.length === 0 &&
+                streamState.hasVisibleText &&
+                contextUsagePercentage === null &&
+                looksLikeTruncatedKiroText(totalContent);
+            if (emittedTruncatedTextContinuation) {
+                logger.warn('[Kiro Stream] Text response appears truncated; emitting max_tokens continuation nudge');
+            }
+
             // 3. 工具调用在流中实时发送，这里不再批量补发
 
             // 计算 output tokens
@@ -2879,7 +3189,7 @@ async saveCredentialsToFile(filePath, newData) {
             const plainForCount = contentBlocksForCount
                 .map(b => (b.type === 'thinking' ? (b.thinking ?? '') : (b.text ?? '')))
                 .join('');
-            outputTokens = this.countTextTokens(plainForCount);
+            outputTokens = this.countTextTokens(`${plainForCount}${totalNativeThinking}`);
 
             for (const tc of toolCalls) {
                 outputTokens += this.countTextTokens(JSON.stringify(tc.input || {}));
@@ -2902,7 +3212,7 @@ async saveCredentialsToFile(filePath, newData) {
             // 4. 发送 message_delta 事件
             yield {
                 type: "message_delta",
-                delta: { stop_reason: toolCalls.length > 0 ? "tool_use" : (emittedOnlyThinking ? "max_tokens" : "end_turn") },
+                delta: { stop_reason: toolCalls.length > 0 ? "tool_use" : (emittedTruncatedTextContinuation ? "max_tokens" : "end_turn") },
                 usage: {
                     input_tokens: inputTokens,
                     output_tokens: outputTokens,

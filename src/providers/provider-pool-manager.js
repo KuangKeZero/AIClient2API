@@ -19,6 +19,35 @@ import {
 import { broadcastEvent } from '../ui-modules/event-broadcast.js';
 import { ENDPOINT_TYPE } from '../utils/common.js';
 
+const KIRO_REAL_USAGE_REFRESH_INTERVAL_MS = 30 * 60 * 1000;
+const KIRO_PREFLIGHT_PERCENT = 95;
+const KIRO_DISABLE_PERCENT = 100;
+
+function isKiroProviderType(providerType) {
+    return providerType === MODEL_PROVIDER.KIRO_API || (
+        typeof providerType === 'string' && providerType.startsWith(`${MODEL_PROVIDER.KIRO_API}-`)
+    );
+}
+
+function clampUsagePercent(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return 0;
+    return Math.min(100, Math.max(0, numeric));
+}
+
+function parseTimestampMs(value) {
+    if (value === null || value === undefined || value === '') return null;
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        return value < 10000000000 ? value * 1000 : value;
+    }
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? null : parsed;
+}
+
+function isoFromMs(ms) {
+    return new Date(ms).toISOString();
+}
+
 function getCustomModelAliasesForProvider(config, providerType) {
     const customModels = Array.isArray(config?.customModels) ? config.customModels : [];
     return new Set(
@@ -648,6 +677,7 @@ export class ProviderPoolManager {
     _usesAccountQuotaLedger(providerType) {
         return !!(
             this.accountQuotaLedger?.enabled &&
+            !isKiroProviderType(providerType) &&
             (typeof this.accountQuotaLedger.supportsProvider !== 'function' || this.accountQuotaLedger.supportsProvider(providerType))
         );
     }
@@ -741,6 +771,238 @@ export class ProviderPoolManager {
             shouldDelete: result.shouldDelete,
             account: result.account
         };
+    }
+
+    _estimateKiroUsagePercentIncrement(providerConfig, model, usage) {
+        const normalizedUsage = usage?.totalTokens !== undefined ? usage : extractTokenUsage(usage);
+        const totalTokens = Number(normalizedUsage?.totalTokens || 0);
+        const cachedTokens = Number(normalizedUsage?.cachedTokens || 0);
+        const billableTokens = Math.max(0, totalTokens - cachedTokens * 0.75);
+        const tokensPerPercent = Math.max(
+            1,
+            Number(this.globalConfig?.KIRO_TOKENS_PER_PERCENT || this.globalConfig?.ACCOUNT_QUOTA_LEDGER?.tokensPerPercent?.default || 250000)
+        );
+
+        let multiplier = 1;
+        const normalizedModel = String(model || '').toLowerCase();
+        if (normalizedModel.includes('opus')) {
+            multiplier = 1.5;
+        } else if (normalizedModel.includes('haiku')) {
+            multiplier = 0.5;
+        }
+
+        const minIncrement = Number(this.globalConfig?.KIRO_MIN_PERCENT_PER_SUCCESSFUL_REQUEST ?? 0.02);
+        if (billableTokens <= 0) {
+            return minIncrement * multiplier;
+        }
+
+        return Math.max(minIncrement, (billableTokens / tokensPerPercent) * multiplier);
+    }
+
+    _getKiroUsageState(providerConfig) {
+        if (!providerConfig.kiroUsage || typeof providerConfig.kiroUsage !== 'object') {
+            const lastRealUsagePercent = providerConfig.kiroLastRealUsagePercent === null || providerConfig.kiroLastRealUsagePercent === undefined
+                ? null
+                : clampUsagePercent(providerConfig.kiroLastRealUsagePercent);
+            providerConfig.kiroUsage = {
+                lastRealUsagePercent,
+                estimatedUsagePercent: lastRealUsagePercent ?? 0,
+                lastRealRefreshAt: providerConfig.kiroLastRealUsageRefreshAt || null,
+                lastRefreshAttemptAt: null,
+                refreshPending: false,
+                lastRefreshReason: null,
+                lastRefreshError: null
+            };
+        }
+        if (providerConfig.kiroUsage.lastRealUsagePercent === null || providerConfig.kiroUsage.lastRealUsagePercent === undefined) {
+            if (providerConfig.kiroLastRealUsagePercent !== null && providerConfig.kiroLastRealUsagePercent !== undefined) {
+                const lastRealUsagePercent = clampUsagePercent(providerConfig.kiroLastRealUsagePercent);
+                providerConfig.kiroUsage.lastRealUsagePercent = lastRealUsagePercent;
+                if (providerConfig.kiroUsage.estimatedUsagePercent === null || providerConfig.kiroUsage.estimatedUsagePercent === undefined) {
+                    providerConfig.kiroUsage.estimatedUsagePercent = lastRealUsagePercent;
+                }
+            }
+        }
+        if (!providerConfig.kiroUsage.lastRealRefreshAt && providerConfig.kiroLastRealUsageRefreshAt) {
+            providerConfig.kiroUsage.lastRealRefreshAt = providerConfig.kiroLastRealUsageRefreshAt;
+        }
+        return providerConfig.kiroUsage;
+    }
+
+    _getKiroRefreshIntervalMs() {
+        const configured = Number(this.globalConfig?.KIRO_REAL_USAGE_REFRESH_INTERVAL_MS);
+        return Number.isFinite(configured) && configured > 0
+            ? configured
+            : KIRO_REAL_USAGE_REFRESH_INTERVAL_MS;
+    }
+
+    _getKiroPreflightPercent() {
+        const configured = Number(this.globalConfig?.KIRO_PREFLIGHT_PERCENT);
+        return Number.isFinite(configured) && configured > 0
+            ? Math.min(configured, KIRO_DISABLE_PERCENT)
+            : KIRO_PREFLIGHT_PERCENT;
+    }
+
+    _recordKiroEstimatedUsage(providerType, uuid, details = {}) {
+        if (!isKiroProviderType(providerType) || !uuid) return null;
+
+        const provider = this._findProvider(providerType, uuid);
+        if (!provider || provider.config.isDisabled) return null;
+
+        const now = Number(details.now) || Date.now();
+        const usage = details.usage?.totalTokens !== undefined
+            ? details.usage
+            : extractTokenUsage(details.usage, details.nativeResponse, details.clientResponse);
+        const state = this._getKiroUsageState(provider.config);
+        const baseline = state.estimatedUsagePercent ??
+            state.lastRealUsagePercent ??
+            provider.config.kiroLastRealUsagePercent ??
+            0;
+        const baselinePercent = clampUsagePercent(Number(baseline || 0));
+        const increment = this._estimateKiroUsagePercentIncrement(provider.config, details.model, usage);
+        const estimatedUsagePercent = clampUsagePercent(baselinePercent + increment);
+        const lastRealRefreshMs = parseTimestampMs(state.lastRealRefreshAt);
+        const refreshIntervalMs = this._getKiroRefreshIntervalMs();
+        const refreshAgeMs = lastRealRefreshMs === null ? Number.POSITIVE_INFINITY : now - lastRealRefreshMs;
+
+        state.estimatedUsagePercent = estimatedUsagePercent;
+        state.lastEstimateAt = isoFromMs(now);
+        state.lastRefreshError = null;
+        provider.config.kiroUsage = state;
+
+        let refreshReason = null;
+        let force = false;
+        const preflightPercent = this._getKiroPreflightPercent();
+        if (estimatedUsagePercent >= KIRO_DISABLE_PERCENT) {
+            refreshReason = 'estimated_full';
+            force = true;
+        } else if (estimatedUsagePercent >= preflightPercent && (baselinePercent < preflightPercent || refreshAgeMs >= refreshIntervalMs)) {
+            refreshReason = 'near_full';
+        } else if (refreshAgeMs >= refreshIntervalMs) {
+            refreshReason = 'low_frequency_verify';
+        }
+
+        if (refreshReason) {
+            this._scheduleKiroUsageRefresh(providerType, provider.config, refreshReason, { force });
+        }
+
+        this._debouncedSave(providerType);
+        return {
+            usage,
+            increment,
+            estimatedUsagePercent,
+            refreshReason,
+            force
+        };
+    }
+
+    _scheduleKiroUsageRefresh(providerType, providerConfig, reason, options = {}) {
+        if (!isKiroProviderType(providerType) || !providerConfig?.uuid) return false;
+        if (providerConfig.isDisabled && !options.force) return false;
+
+        const provider = this._findProvider(providerType, providerConfig.uuid);
+        const targetConfig = provider?.config || providerConfig;
+        const state = this._getKiroUsageState(targetConfig);
+        if (state.refreshPending && !options.force) {
+            return false;
+        }
+
+        state.refreshPending = true;
+        state.lastRefreshAttemptAt = new Date().toISOString();
+        state.lastRefreshReason = reason;
+        targetConfig.kiroUsage = state;
+        this._debouncedSave(providerType);
+
+        const refreshImmediate = setImmediate(() => {
+            this._refreshKiroRealUsage(providerType, targetConfig.uuid, reason).catch(error => {
+                this._log('warn', `[KiroUsage] Real usage refresh failed for ${this._getDisplayName(targetConfig)} (${providerType}): ${error.message}`);
+            });
+        });
+        refreshImmediate.unref?.();
+        return true;
+    }
+
+    applyKiroRealUsage(providerType, uuid, formattedUsage, now = Date.now()) {
+        if (!isKiroProviderType(providerType) || !uuid) {
+            return { applied: false, disabled: false, provider: null };
+        }
+
+        const provider = this._findProvider(providerType, uuid);
+        if (!provider) {
+            return { applied: false, disabled: false, provider: null };
+        }
+
+        const summary = formattedUsage?.summary || formattedUsage || {};
+        const usedPercent = clampUsagePercent(summary.usedPercent ?? summary.percent ?? summary.used_percent ?? 0);
+        const state = this._getKiroUsageState(provider.config);
+        state.lastRealUsagePercent = usedPercent;
+        state.estimatedUsagePercent = usedPercent;
+        state.lastRealRefreshAt = isoFromMs(now);
+        state.refreshPending = false;
+        state.lastRefreshReason = state.lastRefreshReason || 'real_usage';
+        state.lastRefreshError = null;
+        state.plan = summary.plan || state.plan || provider.config.plan || null;
+        state.resetAt = summary.resetAt || summary.reset_at || null;
+        provider.config.kiroUsage = state;
+
+        provider.config.kiroLastRealUsagePercent = usedPercent;
+        provider.config.kiroLastRealUsageRefreshAt = state.lastRealRefreshAt;
+
+        if (usedPercent >= KIRO_DISABLE_PERCENT) {
+            provider.config.isDisabled = true;
+            provider.config.isHealthy = false;
+            provider.config.needsRefresh = false;
+            provider.config.refreshCount = 0;
+            provider.config.errorCount = this.maxErrorCount;
+            provider.config.lastErrorTime = isoFromMs(now);
+            provider.config.lastUsed = isoFromMs(now);
+            provider.config.lastErrorMessage = `Kiro real usage reached 100% (${usedPercent.toFixed(2)}%). Provider disabled.`;
+            provider.config.scheduledRecoveryTime = null;
+            this._log('warn', `[KiroUsage] Disabled ${this._getDisplayName(provider.config)} (${providerType}) after real usage confirmed ${usedPercent.toFixed(2)}%`);
+            this._debouncedSave(providerType);
+            return { applied: true, disabled: true, usedPercent, provider };
+        }
+
+        provider.config.isHealthy = true;
+        provider.config.errorCount = 0;
+        provider.config.lastErrorTime = null;
+        provider.config.lastErrorMessage = null;
+        provider.config.scheduledRecoveryTime = null;
+        provider.config.needsRefresh = false;
+        provider.config.refreshCount = 0;
+        this._debouncedSave(providerType);
+        return { applied: true, disabled: false, usedPercent, provider };
+    }
+
+    async _refreshKiroRealUsage(providerType, uuid, reason = 'manual') {
+        if (!isKiroProviderType(providerType) || !uuid) return null;
+
+        const provider = this._findProvider(providerType, uuid);
+        if (!provider) return null;
+
+        try {
+            const { usageService } = await import('../services/usage-service.js');
+            const formattedUsage = await usageService.getFormattedUsage(providerType, uuid);
+            const result = this.applyKiroRealUsage(providerType, uuid, formattedUsage);
+            const state = this._getKiroUsageState(provider.config);
+            state.lastRefreshReason = reason;
+            provider.config.kiroUsage = state;
+            this._log('info', `[KiroUsage] Real usage refreshed for ${this._getDisplayName(provider.config)} (${providerType}) reason=${reason}`);
+            return result;
+        } catch (error) {
+            const state = this._getKiroUsageState(provider.config);
+            state.refreshPending = false;
+            state.lastRefreshError = error.message;
+            state.lastRefreshReason = reason;
+            provider.config.kiroUsage = state;
+            this._debouncedSave(providerType);
+
+            const authFailure = this._recordAccountAuthFailure(providerType, uuid, error, 'kiro_usage_refresh');
+            if (authFailure.handled && !authFailure.shouldDelete) {
+                this.markProviderUnhealthyImmediately(providerType, provider.config, `Authentication failed during Kiro usage refresh: ${error.message}`);
+            }
+            throw error;
+        }
     }
 
     _syncProviderWithAccountQuota(providerType, providerConfig, account, reason = 'quota') {
@@ -860,6 +1122,10 @@ export class ProviderPoolManager {
     }
 
     recordAccountRequestSuccess(providerType, uuid, details = {}) {
+        if (isKiroProviderType(providerType)) {
+            return this._recordKiroEstimatedUsage(providerType, uuid, details);
+        }
+
         if (!this._usesAccountQuotaLedger(providerType) || !providerType || !uuid) return null;
         const usage = details.usage?.totalTokens !== undefined
             ? details.usage

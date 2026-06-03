@@ -140,6 +140,28 @@ describe('AccountQuotaLedger routing decisions', () => {
         expect(ledger.getPendingRestoreAccounts()).toHaveLength(0);
     });
 
+    test('does not manage Kiro OAuth accounts in the local quota ledger by default', () => {
+        const ledger = new AccountQuotaLedger({ enabled: true, autoLoad: false });
+
+        expect(ledger.supportsProvider('claude-kiro-oauth')).toBe(false);
+        expect(ledger.applyRealUsage('claude-kiro-oauth', 'kiro-1', {
+            summary: {
+                usedPercent: 100,
+                plan: 'FREE',
+                resetAt: '2030-01-01T00:00:00.000Z'
+            }
+        })).toBeNull();
+        expect(ledger.recordEstimatedUsage('claude-kiro-oauth', 'kiro-1', {
+            model: 'claude-sonnet-4-5',
+            usage: { totalTokens: 5000000 }
+        })).toBeNull();
+        expect(ledger.getRoutingDecision('claude-kiro-oauth', { uuid: 'kiro-1' })).toMatchObject({
+            skip: false,
+            reason: null
+        });
+        expect(ledger.getPendingRestoreAccounts('claude-kiro-oauth')).toHaveLength(0);
+    });
+
     test('auto-recovers overdue reset windows after sleep without a real usage refresh', () => {
         const ledger = new AccountQuotaLedger({ enabled: true, autoLoad: false });
         const start = 1700000000000;
@@ -574,6 +596,210 @@ describe('ProviderPoolManager account quota integration', () => {
         expect(manager.providerStatus['openai-codex-oauth'][0].config.isHealthy).toBe(false);
         expect(manager.providerStatus['openai-codex-oauth'][0].config.lastErrorMessage).toContain('AccountQuotaLedger');
     });
+
+    test('schedules a Kiro real usage refresh every 30 minutes at most', () => {
+        const start = Date.parse('2030-01-01T00:00:00.000Z');
+        const manager = createPoolManager({
+            'claude-kiro-oauth': [
+                {
+                    uuid: 'kiro-cadence',
+                    isHealthy: true,
+                    isDisabled: false,
+                    kiroUsage: {
+                        lastRealUsagePercent: 10,
+                        estimatedUsagePercent: 10,
+                        lastRealRefreshAt: new Date(start).toISOString()
+                    }
+                }
+            ]
+        });
+        manager._scheduleKiroUsageRefresh = jest.fn();
+
+        manager.recordAccountRequestSuccess('claude-kiro-oauth', 'kiro-cadence', {
+            model: 'claude-sonnet-4-5',
+            usage: { totalTokens: 1 },
+            now: start + (29 * 60 * 1000)
+        });
+        expect(manager._scheduleKiroUsageRefresh).not.toHaveBeenCalled();
+
+        manager.recordAccountRequestSuccess('claude-kiro-oauth', 'kiro-cadence', {
+            model: 'claude-sonnet-4-5',
+            usage: { totalTokens: 1 },
+            now: start + (31 * 60 * 1000)
+        });
+        expect(manager._scheduleKiroUsageRefresh).toHaveBeenCalledWith(
+            'claude-kiro-oauth',
+            expect.objectContaining({ uuid: 'kiro-cadence' }),
+            'low_frequency_verify',
+            expect.objectContaining({ force: false })
+        );
+    });
+
+    test('schedules a Kiro real usage refresh near full and forces one at 100 percent', () => {
+        const start = Date.parse('2030-01-01T00:00:00.000Z');
+        const manager = createPoolManager({
+            'claude-kiro-oauth': [
+                {
+                    uuid: 'kiro-near',
+                    isHealthy: true,
+                    isDisabled: false,
+                    kiroUsage: {
+                        lastRealUsagePercent: 94,
+                        estimatedUsagePercent: 94,
+                        lastRealRefreshAt: new Date(start).toISOString()
+                    }
+                },
+                {
+                    uuid: 'kiro-full',
+                    isHealthy: true,
+                    isDisabled: false,
+                    kiroUsage: {
+                        lastRealUsagePercent: 99.9,
+                        estimatedUsagePercent: 99.9,
+                        lastRealRefreshAt: new Date(start).toISOString()
+                    }
+                }
+            ]
+        });
+        manager._scheduleKiroUsageRefresh = jest.fn();
+
+        manager.recordAccountRequestSuccess('claude-kiro-oauth', 'kiro-near', {
+            model: 'claude-sonnet-4-5',
+            usage: { totalTokens: 300000 },
+            now: start + (5 * 60 * 1000)
+        });
+        expect(manager._scheduleKiroUsageRefresh).toHaveBeenCalledWith(
+            'claude-kiro-oauth',
+            expect.objectContaining({ uuid: 'kiro-near' }),
+            'near_full',
+            expect.objectContaining({ force: false })
+        );
+
+        manager.recordAccountRequestSuccess('claude-kiro-oauth', 'kiro-full', {
+            model: 'claude-sonnet-4-5',
+            usage: { totalTokens: 300000 },
+            now: start + (6 * 60 * 1000)
+        });
+        expect(manager._scheduleKiroUsageRefresh).toHaveBeenCalledWith(
+            'claude-kiro-oauth',
+            expect.objectContaining({ uuid: 'kiro-full' }),
+            'estimated_full',
+            expect.objectContaining({ force: true })
+        );
+    });
+
+    test('throttles repeated Kiro near-full verification until the 30 minute window elapses', () => {
+        const start = Date.parse('2030-01-01T00:00:00.000Z');
+        const manager = createPoolManager({
+            'claude-kiro-oauth': [
+                {
+                    uuid: 'kiro-near-throttle',
+                    isHealthy: true,
+                    isDisabled: false,
+                    kiroUsage: {
+                        lastRealUsagePercent: 96,
+                        estimatedUsagePercent: 96,
+                        lastRealRefreshAt: new Date(start).toISOString()
+                    }
+                }
+            ]
+        });
+        manager._scheduleKiroUsageRefresh = jest.fn();
+
+        manager.recordAccountRequestSuccess('claude-kiro-oauth', 'kiro-near-throttle', {
+            model: 'claude-sonnet-4-5',
+            usage: { totalTokens: 1 },
+            now: start + (5 * 60 * 1000)
+        });
+        expect(manager._scheduleKiroUsageRefresh).not.toHaveBeenCalled();
+
+        manager.recordAccountRequestSuccess('claude-kiro-oauth', 'kiro-near-throttle', {
+            model: 'claude-sonnet-4-5',
+            usage: { totalTokens: 1 },
+            now: start + (31 * 60 * 1000)
+        });
+        expect(manager._scheduleKiroUsageRefresh).toHaveBeenCalledWith(
+            'claude-kiro-oauth',
+            expect.objectContaining({ uuid: 'kiro-near-throttle' }),
+            'near_full',
+            expect.objectContaining({ force: false })
+        );
+    });
+
+    test('continues Kiro estimates from the last saved real usage after restart', () => {
+        const start = Date.parse('2030-01-01T00:00:00.000Z');
+        const manager = createPoolManager({
+            'claude-kiro-oauth': [
+                {
+                    uuid: 'kiro-saved-real',
+                    isHealthy: true,
+                    isDisabled: false,
+                    kiroLastRealUsagePercent: 94,
+                    kiroLastRealUsageRefreshAt: new Date(start).toISOString()
+                }
+            ]
+        });
+        manager._scheduleKiroUsageRefresh = jest.fn();
+
+        const result = manager.recordAccountRequestSuccess('claude-kiro-oauth', 'kiro-saved-real', {
+            model: 'claude-sonnet-4-5',
+            usage: { totalTokens: 300000 },
+            now: start + (5 * 60 * 1000)
+        });
+
+        expect(result.estimatedUsagePercent).toBeGreaterThanOrEqual(95);
+        expect(manager._scheduleKiroUsageRefresh).toHaveBeenCalledWith(
+            'claude-kiro-oauth',
+            expect.objectContaining({ uuid: 'kiro-saved-real' }),
+            'near_full',
+            expect.objectContaining({ force: false })
+        );
+    });
+
+    test('disables Kiro only after real usage confirms 100 percent', () => {
+        const manager = createPoolManager({
+            'claude-kiro-oauth': [
+                { uuid: 'kiro-full', isHealthy: true, isDisabled: false },
+                { uuid: 'kiro-available', isHealthy: true, isDisabled: false }
+            ]
+        });
+
+        const belowFull = manager.applyKiroRealUsage('claude-kiro-oauth', 'kiro-available', {
+            summary: {
+                usedPercent: 88,
+                plan: 'FREE',
+                totalLimit: 1000000
+            }
+        }, Date.parse('2030-01-01T00:00:00.000Z'));
+        const confirmedFull = manager.applyKiroRealUsage('claude-kiro-oauth', 'kiro-full', {
+            summary: {
+                usedPercent: 100,
+                plan: 'FREE',
+                totalLimit: 1000000
+            }
+        }, Date.parse('2030-01-01T00:01:00.000Z'));
+
+        expect(belowFull.disabled).toBe(false);
+        expect(manager.providerStatus['claude-kiro-oauth'][1].config).toMatchObject({
+            isDisabled: false,
+            isHealthy: true,
+            kiroUsage: {
+                lastRealUsagePercent: 88,
+                estimatedUsagePercent: 88
+            }
+        });
+        expect(confirmedFull.disabled).toBe(true);
+        expect(manager.providerStatus['claude-kiro-oauth'][0].config).toMatchObject({
+            isDisabled: true,
+            isHealthy: false,
+            scheduledRecoveryTime: null,
+            kiroUsage: {
+                lastRealUsagePercent: 100,
+                estimatedUsagePercent: 100
+            }
+        });
+        expect(manager.providerStatus['claude-kiro-oauth'][0].config.lastErrorMessage).toContain('Kiro real usage reached 100');
+    });
 });
 
 describe('Usage API local ledger overlay', () => {
@@ -730,6 +956,66 @@ describe('Usage API local ledger overlay', () => {
             lastRealUsagePercent: 64,
             thresholdPercent: 70
         });
+    });
+
+    test('does not override Kiro real usage with a local ledger snapshot', () => {
+        const ledger = new AccountQuotaLedger({ enabled: true, autoLoad: false });
+        ledger.store.accounts['claude-kiro-oauth:kiro-view'] = {
+            providerType: 'claude-kiro-oauth',
+            uuid: 'kiro-view',
+            customName: null,
+            plan: 'FREE',
+            lastRealUsagePercent: 100,
+            estimatedUsagePercent: 100,
+            resetAt: '2030-01-01T00:00:00.000Z',
+            disabledUntil: '2030-01-01T00:00:00.000Z',
+            confidence: 1,
+            recent429: [],
+            recent401: [],
+            refresh: {
+                pending: false,
+                needsFirstRefresh: false,
+                needsResetConfirm: true,
+                requestedReasons: [],
+                nextVerifyAt: null
+            },
+            deletedAt: null
+        };
+
+        const instanceResult = {
+            uuid: 'kiro-view',
+            name: 'kiro-view',
+            isHealthy: true,
+            isDisabled: false,
+            success: true,
+            usage: {
+                summary: {
+                    usedPercent: 42,
+                    status: 'normal',
+                    plan: 'FREE',
+                    planClass: 'plan-free',
+                    resetAt: '2030-01-01T00:00:00.000Z'
+                },
+                items: []
+            },
+            error: null
+        };
+
+        applyAccountQuotaLedgerToInstance(
+            instanceResult,
+            'claude-kiro-oauth',
+            { uuid: 'kiro-view', plan: 'FREE' },
+            { accountQuotaLedger: ledger }
+        );
+
+        expect(instanceResult.isHealthy).toBe(true);
+        expect(instanceResult.hiddenFromUsageList).toBeUndefined();
+        expect(instanceResult.localQuotaLedger).toBeUndefined();
+        expect(instanceResult.usage.summary).toMatchObject({
+            usedPercent: 42,
+            status: 'normal'
+        });
+        expect(instanceResult.usage.summary.source).toBeUndefined();
     });
 
     test('auto-recovers overdue reset windows in provider usage overlays after sleep', () => {

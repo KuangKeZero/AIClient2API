@@ -4,8 +4,10 @@ import logger from '../utils/logger.js';
 import { atomicWriteFile, withFileLock } from '../utils/file-lock.js';
 
 const LEDGER_VERSION = 1;
+const EXCLUDED_MANAGED_PROVIDER_PREFIXES = [
+    'claude-kiro-oauth'
+];
 const DEFAULT_MANAGED_PROVIDER_PREFIXES = [
-    'claude-kiro-oauth',
     'gemini-cli-oauth',
     'gemini-antigravity',
     'openai-codex-oauth',
@@ -312,6 +314,10 @@ function accountKey(providerType, uuid) {
     return `${providerType}:${uuid}`;
 }
 
+function matchesProviderPrefix(providerType, prefix) {
+    return providerType === prefix || providerType.startsWith(`${prefix}-`);
+}
+
 function planBucket(plan) {
     const normalized = String(plan || '').toLowerCase();
     if (normalized.includes('free')) return 'free';
@@ -344,10 +350,14 @@ export class AccountQuotaLedger {
     supportsProvider(providerType) {
         if (!this.enabled || !providerType) return false;
 
+        if (EXCLUDED_MANAGED_PROVIDER_PREFIXES.some(prefix => matchesProviderPrefix(providerType, prefix))) {
+            return false;
+        }
+
         const prefixes = normalizeStringList(this.options.managedProviderPrefixes, DEFAULT_MANAGED_PROVIDER_PREFIXES);
         if (prefixes.length === 0) return false;
 
-        return prefixes.some(prefix => providerType === prefix || providerType.startsWith(`${prefix}-`));
+        return prefixes.some(prefix => matchesProviderPrefix(providerType, prefix));
     }
 
     load() {

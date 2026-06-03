@@ -10,6 +10,12 @@ import { existsSync, readFileSync } from 'fs';
 
 const CODEX_PLUS_PROVIDER = `${MODEL_PROVIDER.CODEX_API}-plus`;
 
+function isKiroProviderType(providerType) {
+    return providerType === MODEL_PROVIDER.KIRO_API || (
+        typeof providerType === 'string' && providerType.startsWith(`${MODEL_PROVIDER.KIRO_API}-`)
+    );
+}
+
 const supportedProviders = [
     MODEL_PROVIDER.KIRO_API,
     MODEL_PROVIDER.GEMINI_CLI,
@@ -740,6 +746,9 @@ async function getProviderTypeUsage(providerType, currentConfig, providerPoolMan
                 const usage = await usageService.getFormattedUsage(providerType, provider.uuid);
                 instanceResult.success = true;
                 instanceResult.usage = usage;
+                if (isKiroProviderType(providerType)) {
+                    providerPoolManager?.applyKiroRealUsage?.(providerType, provider.uuid, usage);
+                }
                 if (options.recordRealUsage && providerPoolManager?.accountQuotaLedger?.enabled) {
                     providerPoolManager.accountQuotaLedger.applyRealUsage(providerType, provider.uuid, usage);
                 }
@@ -1082,6 +1091,9 @@ export async function handleGetSingleInstanceUsage(req, res, currentConfig, prov
                         const usage = await usageService.getFormattedUsage(providerType, provider.uuid);
                         instanceResult.success = true;
                         instanceResult.usage = usage;
+                        if (isKiroProviderType(providerType)) {
+                            providerPoolManager?.applyKiroRealUsage?.(providerType, provider.uuid, usage);
+                        }
                         if (providerPoolManager?.accountQuotaLedger?.enabled) {
                             providerPoolManager.accountQuotaLedger.applyRealUsage(providerType, provider.uuid, usage);
                         }
