@@ -392,6 +392,10 @@ export function getProtocolPrefix(provider) {
     if (provider === MODEL_PROVIDER.CODEX_API || provider?.startsWith(MODEL_PROVIDER.CODEX_API + '-')) {
         return 'codex';
     }
+    // Special case for AtlasCloud - it uses openai protocol
+    if (provider === 'atlascloud' || provider.startsWith('atlascloud-')) {
+        return 'openai';
+    }
 
     const hyphenIndex = provider.indexOf('-');
     if (hyphenIndex !== -1) {
@@ -748,6 +752,12 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         const needsConversion = getProtocolPrefix(fromProvider) !== getProtocolPrefix(toProvider);
         requestBody.model = model;
         const nativeStream = await service.generateContentStream(model, requestBody);
+        
+        // 如果提供者内部发生了模型回退（如 Antigravity 自动降级），同步更新本地 model 变量
+        // 这确保了后续的监控钩子和统计插件记录的是实际使用的模型
+        if (requestBody.model && requestBody.model !== model) {
+            model = requestBody.model;
+        }
         const addEvent = getProtocolPrefix(fromProvider) === MODEL_PROTOCOL_PREFIX.CLAUDE || getProtocolPrefix(fromProvider) === MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES;
         // 为每个请求生成唯一 ID，用于在单例 converter 中隔离并发流状态
         const streamRequestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
@@ -1106,6 +1116,13 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
         requestBody.model = model;
         // fs.writeFile('oldRequest'+Date.now()+'.json', JSON.stringify(requestBody));
         const nativeResponse = await service.generateContent(model, requestBody);
+        
+        // 如果提供者内部发生了模型回退（如 Antigravity 自动降级），同步更新本地 model 变量
+        // 这确保了后续的监控钩子和统计插件记录的是实际使用的模型
+        if (requestBody.model && requestBody.model !== model) {
+            model = requestBody.model;
+        }
+        
         const responseText = extractResponseText(nativeResponse, toProvider);
 
         // Convert the response back to the client's format (fromProvider), if necessary.
@@ -1560,6 +1577,11 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
         await handleStreamRequest(res, service, model, processedRequestBody, fromProvider, toProvider, CONFIG.PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, actualUuid, actualCustomName, retryContext);
     } else {
         await handleUnaryRequest(res, service, model, processedRequestBody, fromProvider, toProvider, CONFIG.PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, actualUuid, actualCustomName, retryContext);
+    }
+
+    // 同步更新模型名称（如果处理器内部或提供者发生了回退）
+    if (processedRequestBody.model && processedRequestBody.model !== model) {
+        model = processedRequestBody.model;
     }
 
     // 执行插件钩子：内容生成后

@@ -837,7 +837,7 @@ function showSimplePrompt(title, placeholder, callback) {
  * @returns {string} 按钮HTML
  */
 function generateAddGroupButton(providerType) {
-    const allowedTypes = ['claude-custom', 'openai-custom', 'openaiResponses-custom'];
+    const allowedTypes = ['claude-custom', 'openai-custom', 'openaiResponses-custom', 'atlascloud'];
     if (!allowedTypes.includes(providerType)) {
         return '';
     }
@@ -3472,9 +3472,19 @@ function showKiroAwsImportModal() {
                     mergedCredentials.authMethod = 'builder-id';
                 }
                 
-                const response = await window.apiClient.post('/kiro/import-aws-credentials', {
-                    credentials: mergedCredentials
-                });
+                let response;
+                try {
+                    response = await window.apiClient.post('/kiro/import-aws-credentials', {
+                        credentials: mergedCredentials
+                    });
+                } catch (error) {
+                    // 如果是 409 冲突且是重复错误，我们从 error 对象中提取 data，以便后续的重复处理逻辑可以运行
+                    if (error.status === 409 && error.data && error.data.error === 'duplicate') {
+                        response = error.data;
+                    } else {
+                        throw error;
+                    }
+                }
                 
                 if (response.success) {
                     importSuccess = true;
@@ -4314,7 +4324,7 @@ function showAddProviderGroupModal(defaultBaseType = null) {
         const isSupported = cachedSupportedProviders.includes(config.id);
         
         // 2. 限制只能添加特定类型的配置组 (Claude Custom, OpenAI Custom, OpenAI Responses)
-        const allowedTypes = ['claude-custom', 'openai-custom', 'openaiResponses-custom'];
+        const allowedTypes = ['claude-custom', 'openai-custom', 'openaiResponses-custom', 'atlascloud'];
         const isAllowed = allowedTypes.includes(config.id);
         
         return isSupported && isAllowed;

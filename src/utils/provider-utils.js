@@ -74,7 +74,7 @@ export const PROVIDER_MAPPINGS = [
         patterns: ['configs/codex/', '/codex/', '/.codex/'],
         providerType: 'openai-codex-oauth',
         credPathKey: 'CODEX_OAUTH_CREDS_FILE_PATH',
-        defaultCheckModel: 'gpt-5.2-codex',
+        defaultCheckModel: 'gpt-5.4',
         displayName: 'OpenAI Codex OAuth',
         needsProjectId: false,
         urlKeys: ['CODEX_BASE_URL']
@@ -88,7 +88,7 @@ export const PROVIDER_MAPPINGS = [
         defaultCheckModel: 'grok-4.1-mini',
         displayName: 'Grok Web',
         needsProjectId: false,
-        urlKeys: ['GROK_BASE_URL', 'GROK_CF_CLEARANCE', 'GROK_USER_AGENT']
+        urlKeys: ['GROK_BASE_URL', 'GROK_CF_CLEARANCE', 'GROK_USER_AGENT', 'GROK_STATSIG_ID']
     }
 ];
 

@@ -59,7 +59,7 @@ export class OpenAIConverter extends BaseConverter {
     /**
      * 转换请求
      */
-    convertRequest(data, targetProtocol) {
+    convertRequest(data, targetProtocol, requestId) {
         switch (targetProtocol) {
             case MODEL_PROTOCOL_PREFIX.CLAUDE:
                 return this.toClaudeRequest(data);
@@ -68,7 +68,7 @@ export class OpenAIConverter extends BaseConverter {
             case MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES:
                 return this.toOpenAIResponsesRequest(data);
             case MODEL_PROTOCOL_PREFIX.CODEX:
-                return this.toCodexRequest(data);
+                return this.toCodexRequest(data, requestId);
             case MODEL_PROTOCOL_PREFIX.GROK:
                 return this.toGrokRequest(data);
             default:
@@ -79,7 +79,7 @@ export class OpenAIConverter extends BaseConverter {
     /**
      * 转换响应
      */
-    convertResponse(data, targetProtocol, model) {
+    convertResponse(data, targetProtocol, model, requestId) {
         // OpenAI作为源格式时，通常不需要转换响应
         // 因为其他协议会转换到OpenAI格式
         switch (targetProtocol) {
@@ -97,6 +97,13 @@ export class OpenAIConverter extends BaseConverter {
     }
 
     /**
+     * OpenAI → Codex 请求转换
+     */
+    toCodexRequest(data, requestId) {
+        return this.codexConverter.toOpenAIRequestToCodexRequest(data, requestId);
+    }
+
+    /**
      * 转换流式响应块
      */
     convertStreamChunk(chunk, targetProtocol, model, requestId) {
@@ -107,6 +114,8 @@ export class OpenAIConverter extends BaseConverter {
                 return this.toGeminiStreamChunk(chunk, model);
             case MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES:
                 return this.toOpenAIResponsesStreamChunk(chunk, model, requestId);
+            case MODEL_PROTOCOL_PREFIX.CODEX:
+                return this.codexConverter.toOpenAIStreamChunk(chunk, model, requestId);
             case MODEL_PROTOCOL_PREFIX.GROK:
                 return this.toGrokStreamChunk(chunk, model);
             default:

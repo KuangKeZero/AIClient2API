@@ -284,7 +284,7 @@ export class GrokApiService {
 
         let lastUserIdx = -1;
         for (let i = extracted.length - 1; i >= 0; i--) { if (extracted[i].role === 'user') { lastUserIdx = i; break; } }
-        const texts = extracted.map((item, i) => i === lastUserIdx ? item.text : `${item.role}: ${item.text}`);
+        const texts = extracted.map((item, i) => item.role === 'user' ? item.text : `[${item.role}]: ${item.text}`);
         let message = texts.join("\n\n");
         if (toolPrompt) message = `${toolPrompt}\n\n${message}`;
         if (!message.trim() && (imageAttachments.length || localFileAttachments.length)) message = "Refer to the following content:";
@@ -361,28 +361,28 @@ export class GrokApiService {
         if (ssoToken.startsWith("sso=")) ssoToken = ssoToken.substring(4);
         const cookie = ssoToken ? [`sso=${ssoToken}`, `sso-rw=${ssoToken}`] : [];
         if (this.cfClearance) cookie.push(`cf_clearance=${this.cfClearance}`);
+
+        const statsigId = this.config.GROK_STATSIG_ID || this.genStatsigId();
+
         return {
             'accept': '*/*',
-            'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8,ja;q=0.7',
+            'accept-language': 'zh-CN,zh;q=0.9',
             'content-type': 'application/json',
             'cookie': cookie.join('; '),
             'origin': this.baseUrl,
             'priority': 'u=1, i',
             'referer': `${this.baseUrl}/`,
-            'sec-ch-ua': '"Google Chrome";v="143", "Chromium";v="143", "Not A(Brand";v="24"',
-            'sec-ch-ua-arch': '"x86"',
-            'sec-ch-ua-bitness': '"64"',
+            'sec-ch-ua': '"Chromium";v="143", "Google Chrome";v="143", "Not/A)Brand";v="99"',
             'sec-ch-ua-full-version': '"143.0.7499.110"',
-            'sec-ch-ua-full-version-list': '"Google Chrome";v="143.0.7499.110", "Chromium";v="143.0.7499.110", "Not A(Brand";v="24.0.0.0"',
+            'sec-ch-ua-full-version-list': '"Chromium";v="143.0.7499.110", "Google Chrome";v="143.0.7499.110", "Not/A)Brand";v="99.0.0.0"',
             'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-model': '""',
             'sec-ch-ua-platform': '"Windows"',
             'sec-ch-ua-platform-version': '"19.0.0"',
             'sec-fetch-dest': 'empty',
             'sec-fetch-mode': 'cors',
             'sec-fetch-site': 'same-origin',
             'user-agent': this.userAgent,
-            'x-statsig-id': this.genStatsigId(),
+            'x-statsig-id': statsigId,
             'x-xai-request-id': uuidv4()
         };
     }
@@ -562,15 +562,15 @@ export class GrokApiService {
             "isAsyncChat": false,
             "disableSelfHarmShortCircuit": false,
             "collectionIds": [],
-            "connectors": [],
-            "searchAllConnectors": false,
+            "disabledConnectorIds": [],
+            "linkQuery": false,
             "deviceEnvInfo": { 
-                "darkModeEnabled": false, 
-                "devicePixelRatio": 1, 
+                "darkModeEnabled": true, 
+                "devicePixelRatio": 1.75, 
                 "screenWidth": 2560, 
                 "screenHeight": 1440, 
-                "viewportWidth": 1116, 
-                "viewportHeight": 1271 
+                "viewportWidth": 899, 
+                "viewportHeight": 726 
             }
         };
 
