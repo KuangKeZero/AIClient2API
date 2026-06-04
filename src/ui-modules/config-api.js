@@ -79,6 +79,7 @@ export async function handleGetConfig(req, res, currentConfig) {
         SYSTEM_PROMPT_MODE: currentConfig.SYSTEM_PROMPT_MODE,
         PROMPT_LOG_BASE_NAME: currentConfig.PROMPT_LOG_BASE_NAME,
         PROMPT_LOG_MODE: currentConfig.PROMPT_LOG_MODE,
+        REQUEST_BODY_MAX_BYTES: currentConfig.REQUEST_BODY_MAX_BYTES,
         REQUEST_MAX_RETRIES: currentConfig.REQUEST_MAX_RETRIES,
         REQUEST_BASE_DELAY: currentConfig.REQUEST_BASE_DELAY,
         CREDENTIAL_SWITCH_MAX_RETRIES: currentConfig.CREDENTIAL_SWITCH_MAX_RETRIES,
@@ -188,6 +189,10 @@ async function _handleUpdateConfig(req, res, currentConfig, body) {
         }
         if (newConfig.PROMPT_LOG_BASE_NAME !== undefined) currentConfig.PROMPT_LOG_BASE_NAME = newConfig.PROMPT_LOG_BASE_NAME;
         if (newConfig.PROMPT_LOG_MODE !== undefined) currentConfig.PROMPT_LOG_MODE = newConfig.PROMPT_LOG_MODE;
+        if (newConfig.REQUEST_BODY_MAX_BYTES !== undefined) {
+            const v = Number(newConfig.REQUEST_BODY_MAX_BYTES);
+            if (Number.isInteger(v) && v > 0) currentConfig.REQUEST_BODY_MAX_BYTES = v;
+        }
         if (newConfig.REQUEST_MAX_RETRIES !== undefined) {
             const v = Number(newConfig.REQUEST_MAX_RETRIES);
             if (Number.isInteger(v) && v >= 0 && v <= RETRY.MAX_RETRIES) currentConfig.REQUEST_MAX_RETRIES = v;
@@ -350,6 +355,7 @@ async function _handleUpdateConfig(req, res, currentConfig, body) {
                 SYSTEM_PROMPT_REPLACEMENTS: currentConfig.SYSTEM_PROMPT_REPLACEMENTS,
                 PROMPT_LOG_BASE_NAME: currentConfig.PROMPT_LOG_BASE_NAME,
                 PROMPT_LOG_MODE: currentConfig.PROMPT_LOG_MODE,
+                REQUEST_BODY_MAX_BYTES: currentConfig.REQUEST_BODY_MAX_BYTES,
                 REQUEST_MAX_RETRIES: currentConfig.REQUEST_MAX_RETRIES,
                 REQUEST_BASE_DELAY: currentConfig.REQUEST_BASE_DELAY,
                 CREDENTIAL_SWITCH_MAX_RETRIES: currentConfig.CREDENTIAL_SWITCH_MAX_RETRIES,

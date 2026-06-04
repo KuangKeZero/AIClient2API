@@ -3,6 +3,7 @@ import {
     handleContentGenerationRequest,
     API_ACTIONS,
     ENDPOINT_TYPE,
+    getConfiguredRequestBodyMaxBytes,
     getRequestBody,
     getRateLimitCooldownRecoveryTime,
     getProtocolPrefix,
@@ -135,7 +136,9 @@ async function handleImageGenerationRequest(req, res, currentConfig, providerPoo
             ({model, n, response_format, size, virtualOpenAIRequest} = retryContext.parsedBody);
             codexRequestBody = virtualOpenAIRequest;
         } else {
-            const body = await getRequestBody(req);
+            const body = await getRequestBody(req, {
+                maxBytes: getConfiguredRequestBodyMaxBytes(currentConfig)
+            });
             model = body.model || 'gpt-image-2';
             response_format = body.response_format || 'b64_json';
             size = body.size;
@@ -692,4 +695,3 @@ function extractImagesFromServiceResponse(response, providerProtocol, responseFo
     
     return data;
 }
-

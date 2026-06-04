@@ -81,6 +81,7 @@ export async function initializeConfig(args = process.argv.slice(2), configFileP
         PROXY_ENABLED_PROVIDERS: [], // 启用代理的提供商列表，如 ['gemini-cli-oauth', 'claude-kiro-oauth']
         PROMPT_LOG_BASE_NAME: "prompt_log",
         PROMPT_LOG_MODE: "none",
+        REQUEST_BODY_MAX_BYTES: 50 * 1024 * 1024, // API JSON 请求体上限，默认 50MB
         REQUEST_MAX_RETRIES: 3,
         REQUEST_BASE_DELAY: 1000,
         CODEX_FIRST_SSE_TIMEOUT_MS: 15000, // Codex 流式请求首个 SSE 事件超时（毫秒），0 表示关闭
@@ -170,6 +171,7 @@ export async function initializeConfig(args = process.argv.slice(2), configFileP
         { flag: '--system-prompt-mode',   configKey: 'SYSTEM_PROMPT_MODE',     type: 'enum', validValues: ['overwrite', 'append'] },
         { flag: '--host',                 configKey: 'HOST',                   type: 'string' },
         { flag: '--prompt-log-base-name', configKey: 'PROMPT_LOG_BASE_NAME',   type: 'string' },
+        { flag: '--request-body-max-bytes', configKey: 'REQUEST_BODY_MAX_BYTES', type: 'int' },
         { flag: '--request-max-retries',  configKey: 'REQUEST_MAX_RETRIES',    type: 'int' },
         { flag: '--codex-first-sse-timeout-ms', configKey: 'CODEX_FIRST_SSE_TIMEOUT_MS', type: 'int' },
         { flag: '--rate-limit-cooldown-enabled', configKey: 'RATE_LIMIT_COOLDOWN_ENABLED', type: 'bool' },

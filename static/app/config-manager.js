@@ -480,6 +480,7 @@ async function loadConfiguration() {
         const systemPromptModeEl = document.getElementById('systemPromptMode');
         const promptLogBaseNameEl = document.getElementById('promptLogBaseName');
         const promptLogModeEl = document.getElementById('promptLogMode');
+        const requestBodyMaxBytesEl = document.getElementById('requestBodyMaxBytes');
         const requestMaxRetriesEl = document.getElementById('requestMaxRetries');
         const requestBaseDelayEl = document.getElementById('requestBaseDelay');
         const cronNearMinutesEl = document.getElementById('cronNearMinutes');
@@ -499,6 +500,7 @@ async function loadConfiguration() {
         if (systemPromptModeEl) systemPromptModeEl.value = data.SYSTEM_PROMPT_MODE || 'append';
         if (promptLogBaseNameEl) promptLogBaseNameEl.value = data.PROMPT_LOG_BASE_NAME || 'prompt_log';
         if (promptLogModeEl) promptLogModeEl.value = data.PROMPT_LOG_MODE || 'none';
+        if (requestBodyMaxBytesEl) requestBodyMaxBytesEl.value = data.REQUEST_BODY_MAX_BYTES || 52428800;
         if (requestMaxRetriesEl) requestMaxRetriesEl.value = data.REQUEST_MAX_RETRIES || 3;
         if (requestBaseDelayEl) requestBaseDelayEl.value = data.REQUEST_BASE_DELAY || 1000;
         
@@ -696,6 +698,7 @@ async function saveConfiguration(options = {}) {
 
     config.PROMPT_LOG_BASE_NAME = document.getElementById('promptLogBaseName')?.value || '';
     config.PROMPT_LOG_MODE = document.getElementById('promptLogMode')?.value || '';
+    config.REQUEST_BODY_MAX_BYTES = parseInt(document.getElementById('requestBodyMaxBytes')?.value || 52428800);
     config.REQUEST_MAX_RETRIES = parseInt(document.getElementById('requestMaxRetries')?.value || 3);
     config.REQUEST_BASE_DELAY = parseInt(document.getElementById('requestBaseDelay')?.value || 1000);
     config.CREDENTIAL_SWITCH_MAX_RETRIES = parseInt(document.getElementById('credentialSwitchMaxRetries')?.value || 5);

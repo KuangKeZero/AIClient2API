@@ -10,6 +10,13 @@ import { getPluginManager } from '../core/plugin-manager.js';
 import { MODEL_PROTOCOL_PREFIX, MODEL_PROVIDER } from './constants.js';
 import { extractTokenUsage } from '../providers/account-quota-ledger.js';
 
+export const DEFAULT_REQUEST_BODY_MAX_BYTES = 50 * 1024 * 1024;
+
+export function getConfiguredRequestBodyMaxBytes(config = {}) {
+    const maxBytes = Number(config?.REQUEST_BODY_MAX_BYTES);
+    return Number.isFinite(maxBytes) && maxBytes > 0 ? maxBytes : DEFAULT_REQUEST_BODY_MAX_BYTES;
+}
+
 // ==================== 时间与时区 ====================
 
 /**
@@ -582,6 +589,7 @@ export function getRequestBody(req, options = {}) {
             if (maxBytes && receivedBytes > maxBytes) {
                 const error = new Error(`Request body too large. Maximum size is ${maxBytes} bytes.`);
                 error.statusCode = 413;
+                error.code = 'BODY_TOO_LARGE';
                 fail(error);
                 return;
             }
@@ -1434,7 +1442,9 @@ export async function handleModelListRequest(req, res, service, endpointType, CO
  * @param {string} PROMPT_LOG_FILENAME - The prompt log filename.
  */
 export async function handleContentGenerationRequest(req, res, service, endpointType, CONFIG, PROMPT_LOG_FILENAME, providerPoolManager, pooluuid, requestPath = null) {
-    const originalRequestBody = await getRequestBody(req);
+    const originalRequestBody = await getRequestBody(req, {
+        maxBytes: getConfiguredRequestBodyMaxBytes(CONFIG)
+    });
 
     if (!originalRequestBody) {
         throw new Error("Request body is missing for content generation.");
