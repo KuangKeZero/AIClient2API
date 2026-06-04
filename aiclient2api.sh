@@ -131,7 +131,7 @@ start_app() {
     sleep 2
     if is_running "$pid"; then
         info "启动成功，PID: $pid"
-        info "管理界面: http://localhost:3000"
+        info "管理界面: http://localhost:3001"
         return 0
     fi
 
