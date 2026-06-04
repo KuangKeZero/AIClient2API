@@ -82,6 +82,11 @@ export async function handleGetConfig(req, res, currentConfig) {
         REQUEST_BODY_MAX_BYTES: currentConfig.REQUEST_BODY_MAX_BYTES,
         REQUEST_MAX_RETRIES: currentConfig.REQUEST_MAX_RETRIES,
         REQUEST_BASE_DELAY: currentConfig.REQUEST_BASE_DELAY,
+        CODEX_FIRST_SSE_TIMEOUT_MS: currentConfig.CODEX_FIRST_SSE_TIMEOUT_MS,
+        CODEX_STRIP_HISTORY_DATA_IMAGES: currentConfig.CODEX_STRIP_HISTORY_DATA_IMAGES,
+        CODEX_HISTORY_IMAGE_MAX_BYTES: currentConfig.CODEX_HISTORY_IMAGE_MAX_BYTES,
+        CODEX_CURRENT_IMAGE_MAX_BYTES: currentConfig.CODEX_CURRENT_IMAGE_MAX_BYTES,
+        CODEX_LARGE_IMAGE_ARTIFACT_DIR: currentConfig.CODEX_LARGE_IMAGE_ARTIFACT_DIR,
         CREDENTIAL_SWITCH_MAX_RETRIES: currentConfig.CREDENTIAL_SWITCH_MAX_RETRIES,
         RATE_LIMIT_COOLDOWN_ENABLED: currentConfig.RATE_LIMIT_COOLDOWN_ENABLED,
         RATE_LIMIT_COOLDOWN_MS: currentConfig.RATE_LIMIT_COOLDOWN_MS,
@@ -198,6 +203,25 @@ async function _handleUpdateConfig(req, res, currentConfig, body) {
             if (Number.isInteger(v) && v >= 0 && v <= RETRY.MAX_RETRIES) currentConfig.REQUEST_MAX_RETRIES = v;
         }
         if (newConfig.REQUEST_BASE_DELAY !== undefined) currentConfig.REQUEST_BASE_DELAY = newConfig.REQUEST_BASE_DELAY;
+        if (newConfig.CODEX_FIRST_SSE_TIMEOUT_MS !== undefined) {
+            const v = Number(newConfig.CODEX_FIRST_SSE_TIMEOUT_MS);
+            if (Number.isInteger(v) && v >= 0) currentConfig.CODEX_FIRST_SSE_TIMEOUT_MS = v;
+        }
+        if (newConfig.CODEX_STRIP_HISTORY_DATA_IMAGES !== undefined) {
+            currentConfig.CODEX_STRIP_HISTORY_DATA_IMAGES = parseBooleanConfig(newConfig.CODEX_STRIP_HISTORY_DATA_IMAGES);
+        }
+        if (newConfig.CODEX_HISTORY_IMAGE_MAX_BYTES !== undefined) {
+            const v = Number(newConfig.CODEX_HISTORY_IMAGE_MAX_BYTES);
+            if (Number.isInteger(v) && v > 0) currentConfig.CODEX_HISTORY_IMAGE_MAX_BYTES = v;
+        }
+        if (newConfig.CODEX_CURRENT_IMAGE_MAX_BYTES !== undefined) {
+            const v = Number(newConfig.CODEX_CURRENT_IMAGE_MAX_BYTES);
+            if (Number.isInteger(v) && v > 0) currentConfig.CODEX_CURRENT_IMAGE_MAX_BYTES = v;
+        }
+        if (newConfig.CODEX_LARGE_IMAGE_ARTIFACT_DIR !== undefined) {
+            const dir = String(newConfig.CODEX_LARGE_IMAGE_ARTIFACT_DIR).trim();
+            if (dir) currentConfig.CODEX_LARGE_IMAGE_ARTIFACT_DIR = dir;
+        }
         if (newConfig.CREDENTIAL_SWITCH_MAX_RETRIES !== undefined) currentConfig.CREDENTIAL_SWITCH_MAX_RETRIES = newConfig.CREDENTIAL_SWITCH_MAX_RETRIES;
         if (newConfig.RATE_LIMIT_COOLDOWN_ENABLED !== undefined) currentConfig.RATE_LIMIT_COOLDOWN_ENABLED = parseBooleanConfig(newConfig.RATE_LIMIT_COOLDOWN_ENABLED);
         if (newConfig.RATE_LIMIT_COOLDOWN_MS !== undefined) {
@@ -358,6 +382,11 @@ async function _handleUpdateConfig(req, res, currentConfig, body) {
                 REQUEST_BODY_MAX_BYTES: currentConfig.REQUEST_BODY_MAX_BYTES,
                 REQUEST_MAX_RETRIES: currentConfig.REQUEST_MAX_RETRIES,
                 REQUEST_BASE_DELAY: currentConfig.REQUEST_BASE_DELAY,
+                CODEX_FIRST_SSE_TIMEOUT_MS: currentConfig.CODEX_FIRST_SSE_TIMEOUT_MS,
+                CODEX_STRIP_HISTORY_DATA_IMAGES: currentConfig.CODEX_STRIP_HISTORY_DATA_IMAGES,
+                CODEX_HISTORY_IMAGE_MAX_BYTES: currentConfig.CODEX_HISTORY_IMAGE_MAX_BYTES,
+                CODEX_CURRENT_IMAGE_MAX_BYTES: currentConfig.CODEX_CURRENT_IMAGE_MAX_BYTES,
+                CODEX_LARGE_IMAGE_ARTIFACT_DIR: currentConfig.CODEX_LARGE_IMAGE_ARTIFACT_DIR,
                 CREDENTIAL_SWITCH_MAX_RETRIES: currentConfig.CREDENTIAL_SWITCH_MAX_RETRIES,
                 RATE_LIMIT_COOLDOWN_ENABLED: currentConfig.RATE_LIMIT_COOLDOWN_ENABLED,
                 RATE_LIMIT_COOLDOWN_MS: currentConfig.RATE_LIMIT_COOLDOWN_MS,

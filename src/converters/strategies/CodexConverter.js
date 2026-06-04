@@ -3,9 +3,14 @@
  * 处理 OpenAI 协议与 Codex 协议之间的转换
  */
 
+import fs from 'fs';
+import path from 'path';
+import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { BaseConverter } from '../BaseConverter.js';
 import { MODEL_PROTOCOL_PREFIX } from '../../utils/common.js';
+import { CONFIG } from '../../core/config-manager.js';
+import logger from '../../utils/logger.js';
 import {
     generateResponseCreated,
     generateResponseInProgress,
@@ -16,6 +21,79 @@ import {
     generateOutputItemDone,
     generateResponseCompleted
 } from '../../providers/openai/openai-responses-core.mjs';
+
+const DEFAULT_CODEX_STRIP_HISTORY_DATA_IMAGES = true;
+const DEFAULT_CODEX_HISTORY_IMAGE_MAX_BYTES = 256 * 1024;
+const DEFAULT_CODEX_CURRENT_IMAGE_MAX_BYTES = 8 * 1024 * 1024;
+const DEFAULT_CODEX_LARGE_IMAGE_ARTIFACT_DIR = 'logs/codex-image-artifacts';
+
+const DATA_IMAGE_URL_RE = /^data:(image\/[a-zA-Z0-9.+-]+);base64,([\s\S]*)$/;
+const EMBEDDED_DATA_IMAGE_URL_RE = /data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\r\n]+/g;
+
+function parseBooleanConfigValue(value, fallback) {
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'string') {
+        const normalized = value.trim().toLowerCase();
+        if (normalized === 'true') return true;
+        if (normalized === 'false') return false;
+    }
+    return fallback;
+}
+
+function parsePositiveIntegerConfigValue(value, fallback) {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseDataImageUrl(url) {
+    if (typeof url !== 'string') {
+        return null;
+    }
+    const match = url.match(DATA_IMAGE_URL_RE);
+    if (!match) {
+        return null;
+    }
+    const base64 = match[2].replace(/\s/g, '');
+    if (!base64) {
+        return null;
+    }
+    try {
+        const buffer = Buffer.from(base64, 'base64');
+        return {
+            mimeType: match[1].toLowerCase(),
+            base64,
+            bytes: buffer.length,
+            buffer
+        };
+    } catch {
+        return null;
+    }
+}
+
+function getImageExtension(mimeType) {
+    const subtype = String(mimeType || '').split('/')[1] || 'bin';
+    const normalized = subtype.toLowerCase().split(';')[0];
+    if (normalized === 'jpeg') return 'jpg';
+    if (/^[a-z0-9.+-]+$/.test(normalized)) {
+        return normalized.replace(/\+/g, '-');
+    }
+    return 'bin';
+}
+
+function isInsidePath(parentPath, childPath) {
+    const relativePath = path.relative(parentPath, childPath);
+    return relativePath === '' || (!relativePath.startsWith('..') && !path.isAbsolute(relativePath));
+}
+
+function getImageUrlValue(value) {
+    if (typeof value === 'string') {
+        return value;
+    }
+    if (value && typeof value === 'object' && typeof value.url === 'string') {
+        return value.url;
+    }
+    return null;
+}
 
 export class CodexConverter extends BaseConverter {
     constructor() {
@@ -175,6 +253,322 @@ export class CodexConverter extends BaseConverter {
             0;
     }
 
+    getCodexLargeImageConfig() {
+        return {
+            stripHistoryDataImages: parseBooleanConfigValue(
+                CONFIG.CODEX_STRIP_HISTORY_DATA_IMAGES,
+                DEFAULT_CODEX_STRIP_HISTORY_DATA_IMAGES
+            ),
+            historyImageMaxBytes: parsePositiveIntegerConfigValue(
+                CONFIG.CODEX_HISTORY_IMAGE_MAX_BYTES,
+                DEFAULT_CODEX_HISTORY_IMAGE_MAX_BYTES
+            ),
+            currentImageMaxBytes: parsePositiveIntegerConfigValue(
+                CONFIG.CODEX_CURRENT_IMAGE_MAX_BYTES,
+                DEFAULT_CODEX_CURRENT_IMAGE_MAX_BYTES
+            ),
+            artifactDir: typeof CONFIG.CODEX_LARGE_IMAGE_ARTIFACT_DIR === 'string' && CONFIG.CODEX_LARGE_IMAGE_ARTIFACT_DIR.trim()
+                ? CONFIG.CODEX_LARGE_IMAGE_ARTIFACT_DIR.trim()
+                : DEFAULT_CODEX_LARGE_IMAGE_ARTIFACT_DIR
+        };
+    }
+
+    sanitizeCodexRequestLargeImages(codexRequest) {
+        if (!Array.isArray(codexRequest?.input)) {
+            return codexRequest;
+        }
+
+        const config = this.getCodexLargeImageConfig();
+        const viewImagePaths = this.collectViewImageCallPaths(codexRequest.input);
+        const currentUserMessage = this.getCurrentUserMessage(codexRequest.input);
+
+        for (const item of codexRequest.input) {
+            if (!item || typeof item !== 'object') {
+                continue;
+            }
+
+            if (item.type === 'function_call_output') {
+                this.sanitizeHistoricalFunctionOutputImages(item, config, viewImagePaths);
+            } else if (item.type === 'message') {
+                if (item === currentUserMessage) {
+                    this.rejectOversizeCurrentMessageImages(item, config);
+                } else {
+                    this.sanitizeHistoricalMessageImages(item, config);
+                }
+            }
+        }
+
+        return codexRequest;
+    }
+
+    getCurrentUserMessage(inputItems) {
+        for (let i = inputItems.length - 1; i >= 0; i--) {
+            const item = inputItems[i];
+            if (item?.type === 'message' && item.role === 'user') {
+                return item;
+            }
+        }
+        return null;
+    }
+
+    collectViewImageCallPaths(inputItems) {
+        const paths = new Map();
+
+        for (const item of inputItems) {
+            if (!item || item.type !== 'function_call' || item.name !== 'view_image' || !item.call_id) {
+                continue;
+            }
+
+            const args = this.parseToolCallArguments(item.arguments);
+            if (typeof args?.path === 'string' && args.path.trim()) {
+                paths.set(item.call_id, args.path.trim());
+            }
+        }
+
+        return paths;
+    }
+
+    parseToolCallArguments(args) {
+        if (!args) {
+            return null;
+        }
+        if (typeof args === 'object') {
+            return args;
+        }
+        if (typeof args !== 'string') {
+            return null;
+        }
+        try {
+            return JSON.parse(args);
+        } catch {
+            return null;
+        }
+    }
+
+    sanitizeHistoricalFunctionOutputImages(item, config, viewImagePaths) {
+        if (!config.stripHistoryDataImages) {
+            return;
+        }
+
+        const context = {
+            callId: item.call_id || null,
+            sourcePath: item.call_id ? viewImagePaths.get(item.call_id) : null
+        };
+        const sanitized = this.sanitizeHistoricalOutputValue(item.output, config, context);
+        if (sanitized.changed) {
+            item.output = sanitized.value;
+        }
+    }
+
+    sanitizeHistoricalMessageImages(message, config) {
+        if (!config.stripHistoryDataImages || !Array.isArray(message.content)) {
+            return;
+        }
+
+        let changed = false;
+        const content = message.content.map((part, index) => {
+            const sanitized = this.sanitizeHistoricalOutputValue(part, config, {
+                messageRole: message.role || null,
+                imageIndex: index
+            });
+            changed = changed || sanitized.changed;
+            return sanitized.value;
+        });
+
+        if (changed) {
+            message.content = content;
+        }
+    }
+
+    sanitizeHistoricalOutputValue(value, config, context) {
+        if (typeof value === 'string') {
+            return this.sanitizeHistoricalOutputString(value, config, context);
+        }
+
+        if (Array.isArray(value)) {
+            let changed = false;
+            const nextValue = value.map((entry, index) => {
+                const sanitized = this.sanitizeHistoricalOutputValue(entry, config, {
+                    ...context,
+                    imageIndex: index
+                });
+                changed = changed || sanitized.changed;
+                return sanitized.value;
+            });
+            return changed ? { changed: true, value: nextValue } : { changed: false, value };
+        }
+
+        if (!value || typeof value !== 'object') {
+            return { changed: false, value };
+        }
+
+        const imageUrl = getImageUrlValue(value.image_url);
+        const parsedImage = imageUrl ? parseDataImageUrl(imageUrl) : null;
+        if (parsedImage && parsedImage.bytes > config.historyImageMaxBytes) {
+            return {
+                changed: true,
+                value: {
+                    type: 'input_text',
+                    text: this.createHistoricalImagePlaceholder(parsedImage, config, context)
+                }
+            };
+        }
+
+        let changed = false;
+        const nextValue = { ...value };
+        for (const [key, childValue] of Object.entries(value)) {
+            if (key === 'image_url' && imageUrl) {
+                continue;
+            }
+            const sanitized = this.sanitizeHistoricalOutputValue(childValue, config, context);
+            if (sanitized.changed) {
+                changed = true;
+                nextValue[key] = sanitized.value;
+            }
+        }
+
+        return changed ? { changed: true, value: nextValue } : { changed: false, value };
+    }
+
+    sanitizeHistoricalOutputString(value, config, context) {
+        let changed = false;
+        const nextValue = value.replace(EMBEDDED_DATA_IMAGE_URL_RE, (candidate) => {
+            const parsedImage = parseDataImageUrl(candidate);
+            if (!parsedImage || parsedImage.bytes <= config.historyImageMaxBytes) {
+                return candidate;
+            }
+            changed = true;
+            return this.createHistoricalImagePlaceholder(parsedImage, config, context);
+        });
+
+        return changed ? { changed: true, value: nextValue } : { changed: false, value };
+    }
+
+    rejectOversizeCurrentMessageImages(message, config) {
+        if (!Array.isArray(message.content)) {
+            return;
+        }
+
+        for (const part of message.content) {
+            this.assertCurrentImageSizeAllowed(part, config);
+        }
+    }
+
+    assertCurrentImageSizeAllowed(value, config) {
+        if (!value || typeof value !== 'object') {
+            return;
+        }
+
+        const imageUrl = getImageUrlValue(value.image_url);
+        if (imageUrl) {
+            const parsedImage = parseDataImageUrl(imageUrl);
+            if (parsedImage && parsedImage.bytes > config.currentImageMaxBytes) {
+                throw this.createCurrentImageTooLargeError(parsedImage, config);
+            }
+        }
+
+        if (Array.isArray(value)) {
+            for (const entry of value) {
+                this.assertCurrentImageSizeAllowed(entry, config);
+            }
+            return;
+        }
+
+        for (const [key, childValue] of Object.entries(value)) {
+            if (key === 'image_url' && imageUrl) {
+                continue;
+            }
+            this.assertCurrentImageSizeAllowed(childValue, config);
+        }
+    }
+
+    createCurrentImageTooLargeError(imageData, config) {
+        const error = new Error(
+            `Codex input image is too large (${imageData.bytes} bytes). ` +
+            `The configured lossless limit is ${config.currentImageMaxBytes} bytes. ` +
+            'Use a lossless crop or tile the image into smaller pieces instead of lossy compression/downscaling.'
+        );
+        error.status = 413;
+        error.statusCode = 413;
+        error.code = 'CODEX_IMAGE_TOO_LARGE';
+        error.type = 'invalid_request_error';
+        error.param = 'input';
+        error.skipErrorCount = true;
+        error.shouldSwitchCredential = false;
+        return error;
+    }
+
+    createHistoricalImagePlaceholder(imageData, config, context) {
+        const artifact = this.saveLargeImageArtifact(imageData, config.artifactDir);
+        const parts = [
+            'Codex large historical image omitted',
+            `mime=${imageData.mimeType}`,
+            `bytes=${imageData.bytes}`,
+            `sha256=${artifact.sha256}`
+        ];
+
+        if (context?.sourcePath) {
+            parts.push(`source_path=${JSON.stringify(context.sourcePath)}`);
+        }
+        if (artifact.path) {
+            parts.push(`artifact_path=${JSON.stringify(artifact.path)}`);
+        }
+        if (artifact.error) {
+            parts.push(`artifact_save_error=${JSON.stringify(artifact.error)}`);
+        }
+
+        return `[${parts.join(', ')}. Original image bytes were not recompressed; the request payload was stripped to avoid Codex first SSE timeout.]`;
+    }
+
+    saveLargeImageArtifact(imageData, artifactDir) {
+        const sha256 = crypto.createHash('sha256').update(imageData.buffer).digest('hex');
+        const extension = getImageExtension(imageData.mimeType);
+        const requestedDir = path.resolve(process.cwd(), artifactDir || DEFAULT_CODEX_LARGE_IMAGE_ARTIFACT_DIR);
+        const logsDir = path.resolve(process.cwd(), 'logs');
+        const resolvedDir = this.isSafeArtifactDir(requestedDir, logsDir)
+            ? requestedDir
+            : path.resolve(process.cwd(), DEFAULT_CODEX_LARGE_IMAGE_ARTIFACT_DIR);
+        const artifactPath = path.join(resolvedDir, `${sha256}.${extension}`);
+
+        try {
+            fs.mkdirSync(resolvedDir, { recursive: true });
+            if (!fs.existsSync(artifactPath)) {
+                fs.writeFileSync(artifactPath, imageData.buffer, { flag: 'wx' });
+            }
+            logger.warn(`[Codex] Stripped large historical data image from request. artifact=${artifactPath} bytes=${imageData.bytes} sha256=${sha256}`);
+            return { sha256, path: artifactPath };
+        } catch (error) {
+            logger.warn(`[Codex] Failed to save stripped historical data image artifact: ${error.message}`);
+            return { sha256, path: null, error: error.message };
+        }
+    }
+
+    isSafeArtifactDir(requestedDir, logsDir) {
+        if (!isInsidePath(logsDir, requestedDir)) {
+            return false;
+        }
+
+        const existingPath = this.getNearestExistingPath(requestedDir);
+        try {
+            const physicalExistingPath = fs.realpathSync(existingPath);
+            return isInsidePath(logsDir, physicalExistingPath);
+        } catch {
+            return false;
+        }
+    }
+
+    getNearestExistingPath(targetPath) {
+        let current = path.resolve(targetPath);
+        while (!fs.existsSync(current)) {
+            const parent = path.dirname(current);
+            if (parent === current) {
+                return current;
+            }
+            current = parent;
+        }
+        return current;
+    }
+
     /**
      * OpenAI Responses → Codex 请求转换
      */
@@ -266,8 +660,8 @@ export class CodexConverter extends BaseConverter {
         if (codexRequest.text && Object.keys(codexRequest.text).length === 0) {
             delete codexRequest.text;
         }
-    
-        return codexRequest;
+
+        return this.sanitizeCodexRequestLargeImages(codexRequest);
     }
 
     /**
@@ -386,7 +780,7 @@ export class CodexConverter extends BaseConverter {
              }
         }
 
-        return codexRequest;
+        return this.sanitizeCodexRequestLargeImages(codexRequest);
     }
 
     /**

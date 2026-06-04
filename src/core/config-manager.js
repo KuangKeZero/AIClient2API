@@ -85,6 +85,10 @@ export async function initializeConfig(args = process.argv.slice(2), configFileP
         REQUEST_MAX_RETRIES: 3,
         REQUEST_BASE_DELAY: 1000,
         CODEX_FIRST_SSE_TIMEOUT_MS: 15000, // Codex 流式请求首个 SSE 事件超时（毫秒），0 表示关闭
+        CODEX_STRIP_HISTORY_DATA_IMAGES: true, // 是否剥离 Codex 历史工具输出中的大 data:image
+        CODEX_HISTORY_IMAGE_MAX_BYTES: 256 * 1024, // 历史工具输出 data:image 超过此大小后替换为本地 artifact 引用
+        CODEX_CURRENT_IMAGE_MAX_BYTES: 8 * 1024 * 1024, // 当前用户输入图片超过此大小时返回 413，避免无损识别被压缩破坏
+        CODEX_LARGE_IMAGE_ARTIFACT_DIR: 'logs/codex-image-artifacts', // 被剥离历史图片的无损本地保存目录
         CREDENTIAL_SWITCH_MAX_RETRIES: 5, // 坏凭证切换最大重试次数（用于认证错误后切换凭证）
         RATE_LIMIT_COOLDOWN_ENABLED: false, // 429 限流后是否短暂冷却账号
         RATE_LIMIT_COOLDOWN_MS: 30000, // 429 限流默认冷却时间（毫秒）
@@ -174,6 +178,10 @@ export async function initializeConfig(args = process.argv.slice(2), configFileP
         { flag: '--request-body-max-bytes', configKey: 'REQUEST_BODY_MAX_BYTES', type: 'int' },
         { flag: '--request-max-retries',  configKey: 'REQUEST_MAX_RETRIES',    type: 'int' },
         { flag: '--codex-first-sse-timeout-ms', configKey: 'CODEX_FIRST_SSE_TIMEOUT_MS', type: 'int' },
+        { flag: '--codex-strip-history-data-images', configKey: 'CODEX_STRIP_HISTORY_DATA_IMAGES', type: 'bool' },
+        { flag: '--codex-history-image-max-bytes', configKey: 'CODEX_HISTORY_IMAGE_MAX_BYTES', type: 'int' },
+        { flag: '--codex-current-image-max-bytes', configKey: 'CODEX_CURRENT_IMAGE_MAX_BYTES', type: 'int' },
+        { flag: '--codex-large-image-artifact-dir', configKey: 'CODEX_LARGE_IMAGE_ARTIFACT_DIR', type: 'string' },
         { flag: '--rate-limit-cooldown-enabled', configKey: 'RATE_LIMIT_COOLDOWN_ENABLED', type: 'bool' },
         { flag: '--rate-limit-cooldown-ms', configKey: 'RATE_LIMIT_COOLDOWN_MS', type: 'int' },
         { flag: '--rate-limit-cooldown-jitter-ms', configKey: 'RATE_LIMIT_COOLDOWN_JITTER_MS', type: 'int' },
