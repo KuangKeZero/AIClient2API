@@ -397,11 +397,15 @@ function appendCustomModelsToModelList(clientModelList, customEntries, providerT
 export function getProtocolPrefix(provider) {
     // Special case for Codex - it needs its own protocol
     if (provider === MODEL_PROVIDER.CODEX_API || provider?.startsWith(MODEL_PROVIDER.CODEX_API + '-')) {
-        return 'codex';
+        return MODEL_PROTOCOL_PREFIX.CODEX;
+    }
+    // Grok CLI OAuth talks to xAI Responses API directly.
+    if (provider === MODEL_PROVIDER.GROK_CLI || provider?.startsWith(MODEL_PROVIDER.GROK_CLI + '-')) {
+        return MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES;
     }
     // Special case for AtlasCloud - it uses openai protocol
     if (provider === 'atlascloud' || provider.startsWith('atlascloud-')) {
-        return 'openai';
+        return MODEL_PROTOCOL_PREFIX.OPENAI;
     }
 
     const hyphenIndex = provider.indexOf('-');
@@ -583,6 +587,15 @@ export function getRequestBody(req, options = {}) {
             reject(error);
         };
 
+        const rejectTooLarge = (error) => {
+            if (settled) return;
+            settled = true;
+            if (typeof req.resume === 'function') {
+                req.resume();
+            }
+            reject(error);
+        };
+
         req.on('data', chunk => {
             if (settled) return;
             receivedBytes += chunk.length;
@@ -590,7 +603,7 @@ export function getRequestBody(req, options = {}) {
                 const error = new Error(`Request body too large. Maximum size is ${maxBytes} bytes.`);
                 error.statusCode = 413;
                 error.code = 'BODY_TOO_LARGE';
-                fail(error);
+                rejectTooLarge(error);
                 return;
             }
             body += chunk.toString();
@@ -2000,6 +2013,33 @@ export function extractSystemPromptFromRequestBody(requestBody, provider) {
                 }
             }
             break;
+        case MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES: {
+            if (typeof requestBody.instructions === 'string') {
+                incomingSystemText = requestBody.instructions;
+            } else if (requestBody.instructions) {
+                incomingSystemText = JSON.stringify(requestBody.instructions);
+            } else if (Array.isArray(requestBody.input)) {
+                const responsesSystemItem = requestBody.input.find(item =>
+                    item?.role === 'system' ||
+                    item?.role === 'developer' ||
+                    item?.type === 'system' ||
+                    item?.type === 'developer' ||
+                    (item?.type === 'message' && (item?.role === 'system' || item?.role === 'developer'))
+                );
+
+                const content = responsesSystemItem?.content;
+                if (typeof content === 'string') {
+                    incomingSystemText = content;
+                } else if (Array.isArray(content)) {
+                    incomingSystemText = content
+                        .map(part => typeof part === 'string' ? part : (part?.text || part?.content || JSON.stringify(part)))
+                        .join('\n');
+                } else if (content) {
+                    incomingSystemText = JSON.stringify(content);
+                }
+            }
+            break;
+        }
         default:
             logger.warn(`[System Prompt] Unknown provider: ${provider}`);
             break;

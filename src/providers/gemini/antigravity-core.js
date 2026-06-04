@@ -19,6 +19,7 @@ import { getProxyConfigForProvider, getGoogleAuthProxyConfig, isTLSSidecarEnable
 import { cleanJsonSchemaProperties } from '../../converters/utils.js';
 import { getProviderPoolManager } from '../../services/service-manager.js';
 import { MODEL_PROVIDER } from '../../utils/common.js';
+import { normalizeAntigravityToolConfig } from './antigravity-tool-config.js';
 
 // --- Constants ---
 const CREDENTIALS_DIR = '.antigravity';
@@ -469,19 +470,19 @@ function geminiToAntigravity(modelName, payload, projectId) {
         delete template.request.safetySettings;
     }
 
-    if (template.toolConfig && !template.request.toolConfig) {
-        template.request.toolConfig = template.toolConfig;
+    if (template.tool_config && !template.toolConfig) {
+        template.toolConfig = template.tool_config;
+    }
+    delete template.tool_config;
+
+    if (template.toolConfig) {
+        if (!template.request.toolConfig) {
+            template.request.toolConfig = template.toolConfig;
+        }
         delete template.toolConfig;
     }
 
-    if (template.request.toolConfig) {
-        if (!template.request.toolConfig.functionCallingConfig) {
-            template.request.toolConfig.functionCallingConfig = {};
-        }
-        if (isClaudeModel) {
-            template.request.toolConfig.functionCallingConfig.mode = 'VALIDATED';
-        }
-    }
+    normalizeAntigravityToolConfig(template.request, isClaudeModel);
 
     const maxOutputTokens = template.request.generationConfig?.maxOutputTokens;
     const modelMaxOutputTokens = getAntigravityModelMetadata(modelName)?.maxOutputTokens;

@@ -60,6 +60,7 @@ export class GrokApiService {
         this.uuid = config.uuid;
         this.token = config.GROK_COOKIE_TOKEN;
         this.cfClearance = config.GROK_CF_CLEARANCE;
+        this.cfBm = config.GROK_CF_BM;
         this.userAgent = config.GROK_USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36';
         this.baseUrl = config.GROK_BASE_URL || 'https://grok.com';
         this.chatApi = `${this.baseUrl}/rest/app-chat/conversations/new`;
@@ -361,6 +362,7 @@ export class GrokApiService {
         if (ssoToken.startsWith("sso=")) ssoToken = ssoToken.substring(4);
         const cookie = ssoToken ? [`sso=${ssoToken}`, `sso-rw=${ssoToken}`] : [];
         if (this.cfClearance) cookie.push(`cf_clearance=${this.cfClearance}`);
+        if (this.cfBm) cookie.push(`__cf_bm=${this.cfBm}`);
 
         const statsigId = this.config.GROK_STATSIG_ID || this.genStatsigId();
 
@@ -539,7 +541,7 @@ export class GrokApiService {
         };
 
         const payload = {
-            "temporary": requestBody.temporary !== undefined ? requestBody.temporary : true,
+            "temporary": true,
             "message": message,
             "parentResponseId": requestBody.parentResponseId || undefined,
             "disableSearch": false,

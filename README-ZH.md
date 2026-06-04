@@ -152,6 +152,7 @@
 > <details>
 > <summary>点击展开查看详细版本历史</summary>
 > 
+> - **2026.06.03** - 新增 Grok Build（Grok CLI）支持：接入 `grok-cli-oauth` 的 xAI OAuth / Responses API 调用链，支持 Grok Build 文本模型、多协议转换、内置工具（网页搜索、X 搜索、代码解释器、集合/附件搜索）以及图片/视频生成模型。
 > - **2026.05.04 (v3.0.0)** - **里程碑更新：AI 深度集成与自发现架构**。新增自动化 Skill 指南与远程 `/api/help`、`/api/example` 接口，支持 AI 代理无缝理解并操作 50+ 个全量 API 端点；实现了 CLI 与 REST API 输出结果的完全统一，增强了结构化 JSON 支持。
 > - **2026.04.29** - 全面支持 OpenAI 标准的图片生成 (`/v1/images/generations`) 与编辑 (`/v1/images/edits`) 接口。支持自动将 OpenAI 格式请求转换为各模型对应的原生生图协议，并适配号池轮询与自动重试机制，大幅提升多模态创作的稳定性。
 > - **2026.03.02** - 新增 Grok 协议支持，支持通过 Cookie/SSO 方式访问 xAI Grok 系列模型（Grok），支持多模态输入、图片/视频生成、自动 token 刷新及流式输出
@@ -243,12 +244,12 @@
 #### 🐳 Docker 快捷启动 (推荐)
 
 ```bash
-docker run -d -p 3000:3000 -p 8085-8086:8085-8086 -p 1455:1455 -p 19876-19880:19876-19880 --restart=always -v "指定路径/configs:/app/configs" -v "指定路径/plugins:/app/src/plugins-user" --name aiclient2api justlikemaki/aiclient-2-api
+docker run -d -p 3000:3000 -p 8085-8086:8085-8086 -p 1455:1455 -p 56121:56121 -p 19876-19880:19876-19880 --restart=always -v "指定路径/configs:/app/configs" -v "指定路径/plugins:/app/src/plugins-user" --name aiclient2api justlikemaki/aiclient-2-api
 ```
 
 **参数说明**：
 - `-d`：后台运行容器
-- `-p 3000:3000 ...`：端口映射。3000 为 Web UI，其余为 OAuth 回调端口（Gemini: 8085, Antigravity: 8086, Codex: 1455, Kiro: 19876-19880）
+- `-p 3000:3000 ...`：端口映射。3000 为 Web UI，其余为 OAuth 回调端口（Gemini: 8085, Antigravity: 8086, Codex: 1455, Grok CLI: 56121, Kiro: 19876-19880）
 - `--restart=always`：容器自动重启策略
 - `-v "指定路径/configs:/app/configs"`：挂载配置目录（请将"指定路径"替换为实际路径，如 `/home/user/aiclient2api`）
 - `-v "指定路径/plugins:/app/src/plugins-user"`：挂载用户插件目录
@@ -359,7 +360,7 @@ docker compose up -d
 
 #### 最新模型支持
 无缝支持以下最新大模型，仅需在 Web UI 或 [`configs/config.json`](./configs/config.json) 中配置相应的端点：
-*   **Grok** - xAI 旗舰模型，现已通过 Grok Cookie/SSO 支持，支持思考模型、图片生成及视频生成
+*   **Grok / Grok Build** - xAI 旗舰模型，现已通过 Grok Cookie/SSO 与 Grok CLI OAuth 支持，支持思考模型、Grok Build、内置工具、图片生成及视频生成
 *   **Claude Opus** - Anthropic 史上最强模型，现已通过 Kiro, Antigravity 支持
 *   **Gemini Pro** - Google 下一代架构预览版，现已通过 Gemini, Antigravity 支持
 *   **Kimi / MiniMax** - 国内顶级旗舰模型同步支持，现已通过自定义OpenAI，Claude 支持
@@ -442,6 +443,12 @@ curl http://localhost:3000/claude-kiro-oauth/v1/chat/completions \
 3. **自动保存**：授权成功后，系统会自动保存 Codex 的 OAuth 凭据文件
 4. **回调端口**：确保 OAuth 回调端口 `1455` 未被占用
 
+#### Grok CLI OAuth 配置
+1. **生成授权**：在 Web UI 的“提供商池”或“配置管理”页面，点击 Grok CLI 的“生成授权”按钮
+2. **浏览器登录**：系统将打开 xAI 授权页面，完成 OAuth 登录
+3. **自动保存**：授权成功后，系统会自动保存 Grok CLI OAuth 凭据文件到 `configs/grok-cli/`
+4. **回调端口**：确保 OAuth 回调端口 `56121` 未被占用
+
 #### Grok Cookie/SSO 配置
 1. **获取 SSO 令牌**：登录 [Grok 官网](https://grok.com/)，在浏览器开发者工具的 Application -> Cookies 中复制 `sso` 的值
 2. **填入配置**：在 Web UI 的“配置管理”或直接修改配置文件，将令牌填入 `GROK_COOKIE_TOKEN`
@@ -472,6 +479,7 @@ curl http://localhost:3000/claude-kiro-oauth/v1/chat/completions \
 | **Kiro** | `~/.aws/sso/cache/kiro-auth-token.json` | Kiro 认证令牌 |
 | **Antigravity** | `~/.antigravity/oauth_creds.json` | Antigravity OAuth 凭据 (支持 Claude Opus) |
 | **Codex** | `~/.codex/oauth_creds.json` | Codex OAuth 凭据 |
+| **Grok CLI** | `configs/grok-cli/..._xai-..._oauth_creds.json` | Grok CLI OAuth 凭据 |
 
 > **说明**：`~` 表示用户主目录（Windows: `C:\Users\用户名`，Linux/macOS: `/home/用户名` 或 `/Users/用户名`）
 
@@ -649,7 +657,7 @@ curl http://localhost:3000/claude-kiro-oauth/v1/chat/completions \
 
 **解决方案**：
 - **检查网络连接**：确保能够正常访问 Google、阿里云等服务
-- **检查端口占用**：OAuth 回调需要特定端口（Gemini: 8085, Antigravity: 8086, Codex: 1455, Kiro: 19876-19880），确保这些端口未被占用
+- **检查端口占用**：OAuth 回调需要特定端口（Gemini: 8085, Antigravity: 8086, Codex: 1455, Grok CLI: 56121, Kiro: 19876-19880），确保这些端口未被占用
 - **清除浏览器缓存**：尝试使用无痕模式或清除浏览器缓存后重试
 - **检查防火墙设置**：确保防火墙允许本地回调端口的访问
 - **Docker 用户**：确保已正确映射所有 OAuth 回调端口

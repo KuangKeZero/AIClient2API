@@ -60,7 +60,7 @@ describe('OpenAI chat stream to Responses tool calls', () => {
 
         const functionCall = completed.response.output.find(item => item.type === 'function_call');
         expect(functionCall).toMatchObject({
-            id: 'call_skill_1',
+            id: 'fc_call_skill_1',
             call_id: 'call_skill_1',
             name: 'Skill',
             arguments: '{"command":"superpowers:using-superpowers"}',
