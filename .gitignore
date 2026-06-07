@@ -22,6 +22,7 @@ model-usage-stats.json
 AGENTS.md
 src/plugins-user/
 .aiclient2api.pid
+.aiclient2api.windows.pid.json
 configs/pwd
 configs/codex/
 configs/codex-plus/

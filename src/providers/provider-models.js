@@ -254,6 +254,19 @@ export function getConfiguredSupportedModels(providerType, providerConfig = {}) 
     return normalizeModelIds(providerConfig?.supportedModels);
 }
 
+export function selectDefaultHealthCheckModel(providerType, providerConfig = {}) {
+    const supportedModels = getConfiguredSupportedModels(providerType, providerConfig);
+    if (supportedModels.length === 0) {
+        return null;
+    }
+
+    return supportedModels.find(model => model === 'gpt-5.5') ||
+        supportedModels.find(model =>
+            model.includes('flash') || model.includes('mini') || model.includes('3.5') || model.includes('small')
+        ) ||
+        supportedModels[0];
+}
+
 /**
  * 获取指定提供商类型支持的模型列表
  * @param {string} providerType - 提供商类型

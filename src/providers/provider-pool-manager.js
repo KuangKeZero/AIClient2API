@@ -14,7 +14,8 @@ import {
     getConfiguredSupportedModels,
     getCustomModelListProvider,
     getProviderModels,
-    normalizeModelIds
+    normalizeModelIds,
+    selectDefaultHealthCheckModel
 } from './provider-models.js';
 import { broadcastEvent } from '../ui-modules/event-broadcast.js';
 import { ENDPOINT_TYPE } from '../utils/common.js';
@@ -2740,6 +2741,7 @@ export class ProviderPoolManager {
             const providerCheckStart = Date.now();
             const baseProviderType = this._getBaseProviderType(providerType);
             const checkModelName = provider.config.checkModelName || 
+                                selectDefaultHealthCheckModel(providerType, provider.config) ||
                                 ProviderPoolManager.DEFAULT_HEALTH_CHECK_MODELS[providerType] || 
                                 ProviderPoolManager.DEFAULT_HEALTH_CHECK_MODELS[baseProviderType] || 
                                 'unknown';
@@ -2873,6 +2875,7 @@ export class ProviderPoolManager {
         // 确定健康检查使用的模型名称
         const baseProviderType = this._getBaseProviderType(providerType);
         const modelName = providerConfig.checkModelName ||
+                        selectDefaultHealthCheckModel(providerType, providerConfig) ||
                         ProviderPoolManager.DEFAULT_HEALTH_CHECK_MODELS[providerType] ||
                         ProviderPoolManager.DEFAULT_HEALTH_CHECK_MODELS[baseProviderType];
 

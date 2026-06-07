@@ -6,6 +6,7 @@ import {
     getConfiguredSupportedModels,
     getProviderModels,
     normalizeModelIds,
+    selectDefaultHealthCheckModel,
     usesManagedModelList
 } from '../providers/provider-models.js';
 import { generateUUID, createProviderConfig, formatSystemPath, detectProviderFromPath, addToUsedPaths, isPathUsed, pathsEqual } from '../utils/provider-utils.js';
@@ -146,12 +147,8 @@ async function runProviderHealthCheck(providerPoolManager, providerType, provide
         // 对于管理模型列表的提供商，如果配置了支持的模型，从中挑选一个用于健康检查
         let checkModelName = providerConfig.checkModelName;
         if (!checkModelName && usesManagedModelList(providerType)) {
-            const supportedModels = getConfiguredSupportedModels(providerType, providerConfig);
-            if (supportedModels.length > 0) {
-                // 优先挑选常见的/轻量级的模型，或者直接取第一个
-                checkModelName = supportedModels.find(m =>
-                    m.includes('flash') || m.includes('mini') || m.includes('3.5') || m.includes('small')
-                ) || supportedModels[0];
+            checkModelName = selectDefaultHealthCheckModel(providerType, providerConfig);
+            if (checkModelName) {
                 logger.info(`[UI API] Selected model ${checkModelName} for health check of managed provider ${providerConfig.uuid}`);
             }
         }
