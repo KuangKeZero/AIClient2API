@@ -1198,8 +1198,8 @@ function showCodexBatchImportModal(providerType) {
                                     if (current.success) {
                                         resultItem.innerHTML = `Token ${current.index}: <span style="color: #166534;">✓ ${current.path}</span>`;
                                     } else if (current.error === 'duplicate') {
-                                        resultItem.innerHTML = `Token ${current.index}: <span style="color: #d97706;">⚠ ${t('oauth.kiro.duplicateToken')}</span>
-                                            ${current.existingPath ? `<span style="color: #666; font-size: 11px;">(${current.existingPath})</span>` : ''}`;
+                                        resultItem.innerHTML = `Token ${current.index}: <span style="color: #d97706;">⚠ ${escapeHtml(getCodexDuplicateCredentialMessage(current.duplicateField))}</span>
+                                            ${current.existingPath ? `<span style="color: #666; font-size: 11px;">(${escapeHtml(current.existingPath)})</span>` : ''}`;
                                     } else {
                                         resultItem.innerHTML = `Token ${current.index}: <span style="color: #991b1b;">✗ ${current.error}</span>`;
                                     }
@@ -1692,6 +1692,18 @@ function getCodexExternalImportStats(source, data) {
     };
 }
 
+function getCodexDuplicateCredentialMessage(duplicateField) {
+    const fieldKey = duplicateField === 'access_token'
+        ? 'oauth.codex.duplicateFieldAccessToken'
+        : duplicateField === 'refresh_token'
+            ? 'oauth.codex.duplicateFieldRefreshToken'
+            : 'oauth.codex.duplicateFieldCredential';
+
+    return t('oauth.codex.duplicateCredentials', {
+        field: t(fieldKey)
+    });
+}
+
 /**
  * 显示 Codex CPA/sub2api 外部格式批量导入模态框
  * @param {string} providerType - 提供商类型
@@ -1878,7 +1890,7 @@ function showCodexExternalImportModal(providerType, source) {
                                     const mode = current.accessTokenOnly ? ` <span style="color: #92400e;">(${t('oauth.codex.accessTokenOnly')})</span>` : '';
                                     resultItem.innerHTML = `${escapeHtml(current.email || 'Codex')}: <span style="color: #166534;">✓ ${escapeHtml(current.path || '')}</span>${mode}`;
                                 } else if (current.error === 'duplicate') {
-                                    resultItem.innerHTML = `${escapeHtml(current.email || `#${current.index}`)}: <span style="color: #d97706;">⚠ ${escapeHtml(t('oauth.kiro.duplicateToken'))}</span>
+                                    resultItem.innerHTML = `${escapeHtml(current.email || `#${current.index}`)}: <span style="color: #d97706;">⚠ ${escapeHtml(getCodexDuplicateCredentialMessage(current.duplicateField))}</span>
                                         ${current.existingPath ? `<span style="color: #666; font-size: 11px;">(${escapeHtml(current.existingPath)})</span>` : ''}`;
                                 } else {
                                     resultItem.innerHTML = `${escapeHtml(current.email || `#${current.index}`)}: <span style="color: #991b1b;">✗ ${escapeHtml(current.error || '')}</span>`;

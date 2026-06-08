@@ -38,6 +38,27 @@ function sanitizeCodexCredentialFilenamePart(value) {
     return sanitized || 'default';
 }
 
+function cleanCredentialString(value) {
+    return typeof value === 'string' ? value.trim() : '';
+}
+
+function getCodexDuplicateField(credentials, candidate) {
+    const refreshToken = cleanCredentialString(candidate.refreshToken);
+    const accessToken = cleanCredentialString(candidate.accessToken);
+    const existingRefreshToken = cleanCredentialString(credentials?.refresh_token);
+    const existingAccessToken = cleanCredentialString(credentials?.access_token);
+
+    if (refreshToken && existingRefreshToken === refreshToken) {
+        return 'refresh_token';
+    }
+
+    if (!refreshToken && accessToken && existingAccessToken === accessToken) {
+        return 'access_token';
+    }
+
+    return null;
+}
+
 /**
  * 关闭指定端口的活动服务器
  */
@@ -622,12 +643,13 @@ class CodexAuth {
     }
 
     /**
-     * 检查凭据是否已存在（基于 account_id 或 refresh_token）
-     * @param {string} accountId 
-     * @param {string} refreshToken 
-     * @returns {Promise<{isDuplicate: boolean, existingPath?: string}>}
+     * 检查凭据是否已存在。
+     * refresh_token 才是可刷新凭据的稳定唯一键；CPA 团队账号可能共享 account_id。
+     * access-token-only 凭据使用 access_token 精确匹配兜底。
+     * @param {{refreshToken?: string, accessToken?: string}} candidate
+     * @returns {Promise<{isDuplicate: boolean, existingPath?: string, duplicateField?: string}>}
      */
-    async checkDuplicate(accountId, refreshToken) {
+    async checkDuplicate(candidate = {}) {
         const projectDir = process.cwd();
         const targetDir = path.join(projectDir, 'configs', 'codex');
 
@@ -643,12 +665,14 @@ class CodexAuth {
                         const fullPath = path.join(targetDir, file);
                         const content = await fs.promises.readFile(fullPath, 'utf8');
                         const credentials = JSON.parse(content);
+                        const duplicateField = getCodexDuplicateField(credentials, candidate);
 
-                        if ((accountId && credentials.account_id === accountId) || (refreshToken && credentials.refresh_token === refreshToken)) {
+                        if (duplicateField) {
                             const relativePath = path.relative(process.cwd(), fullPath);
                             return {
                                 isDuplicate: true,
-                                existingPath: relativePath
+                                existingPath: relativePath,
+                                duplicateField
                             };
                         }
                     } catch (e) {
@@ -734,7 +758,10 @@ export async function batchImportCodexTokensStream(tokens, onProgress = null, sk
 
             // 检查重复
             if (!skipDuplicateCheck) {
-                const duplicateCheck = await auth.checkDuplicate(accountId, refreshToken);
+                const duplicateCheck = await auth.checkDuplicate({
+                    refreshToken,
+                    accessToken: tokenData.access_token
+                });
                 if (duplicateCheck.isDuplicate) {
                     progressData.current = {
                         index: i + 1,
@@ -742,7 +769,8 @@ export async function batchImportCodexTokensStream(tokens, onProgress = null, sk
                         error: 'duplicate',
                         email,
                         accountId,
-                        existingPath: duplicateCheck.existingPath
+                        existingPath: duplicateCheck.existingPath,
+                        duplicateField: duplicateCheck.duplicateField
                     };
                     results.failed++;
                     results.details.push(progressData.current);
